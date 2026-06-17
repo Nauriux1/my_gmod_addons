@@ -4,11 +4,14 @@ A modern, sleek replacement for the default Garry's Mod voice chat panel.
 
 ## Features
 
-- **Modern Design**: Clean, rounded panels with smooth animations
-- **Speaking Indicator**: Animated bar that shows voice volume
-- **Smooth Fades**: Panels fade in/out smoothly
-- **Multiple Speakers**: Shows all talking players at once
-- **No Performance Impact**: Lightweight and optimized
+Modern Design: Clean, rounded panels with smooth animations
+
+Speaking Indicator: Animated bar that shows voice volume
+
+Smooth Fades: Panels fade in/out smoothly
+
+Multiple Speakers**: Shows all talking players at once
+
 
 
 
