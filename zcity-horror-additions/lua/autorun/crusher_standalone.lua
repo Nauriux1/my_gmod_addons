@@ -26,7 +26,7 @@ local CRUSHER_LANG       = {
     en = {
         unresponsive  = "They seem unresponsive.",
         gave          = "Gave Crusher abilities to ",
-        got           = "You have Crusher abilities.  ALT+E — grab,  [ — crush head,  ] — break neck,  G — choke,  R — release.",
+        got           = "You have Crusher abilities.  ALT+E — grab,  [ — crush head,  ] — break neck,  G — choke,  R — release.  Bind a key to \"crusher_second_grab\" to grab a second victim while already holding one.",
         removed       = "Removed Crusher from ",
         hint_hold     = "Hold ",
         breaking_neck = "breaking neck...",
@@ -115,6 +115,41 @@ local function StartGrabbingHead(ply, other_ply)
     end
 end
 
+-- Second grab: while already holding a primary victim, the crusher can
+-- also grab a second nearby player with his free hand and drag them
+-- along. This is deliberately NOT a second full ragdoll-carry -- the
+-- carry system (hg.SetCarryEnt2 / the "carryent2" netvar) is a single
+-- slot per player, already spoken for by the primary grab. The second
+-- victim instead just gets crippled movement and a leash-distance check,
+-- same shape as the primary grab minus the physical carry. Subordinate
+-- to the primary grab on purpose: if the primary victim goes free, the
+-- second one does too, so it never becomes a standalone duplicate grab
+-- with its own crush/choke/neckbreak (those all stay single-target).
+local function StopSecondGrab(ply)
+    if not ply.Ability_SecondGrab then return end
+    local victim = ply.Ability_SecondGrab.Victim
+    if IsValid(victim) then
+        victim.BeingVictimOfCrusherSecondGrab = false
+        if SERVER then
+            net.Start("HMCD_BeingVictimOfSecondGrab")
+            net.WriteBool(false)
+            net.Send(victim)
+        end
+    end
+    ply.Ability_SecondGrab = nil
+end
+
+local function StartSecondGrab(ply, victim)
+    ply.Ability_SecondGrab = { Victim = victim, GrabbedAt = CurTime() }
+    victim.BeingVictimOfCrusherSecondGrab = true
+    if SERVER then
+        victim:ViewPunch(Angle(0, -5, -5))
+        net.Start("HMCD_BeingVictimOfSecondGrab")
+        net.WriteBool(true)
+        net.Send(victim)
+    end
+end
+
 local function StopGrabbingHead(ply)
     if not ply.Ability_HeadGrab then return end
     local victim = ply.Ability_HeadGrab.Victim
@@ -134,6 +169,7 @@ local function StopGrabbingHead(ply)
         net.SendPVS(ply:GetShootPos())
         hg.SetCarryEnt2(ply)
     end
+    StopSecondGrab(ply)
     ply.Ability_HeadGrab = nil
     ply.Ability_Choke = nil
 end
@@ -434,26 +470,8 @@ local function blastThatShit(ply)
         mins   = -Vector(5, 5, 5),
         maxs   = Vector(5, 5, 5),
     })
-    
     if tr.Hit and IsValid(tr.Entity) and hgIsDoor(tr.Entity) then
-        local door = tr.Entity
-        local aimForce = ply:GetAimVector()
-        
-        -- Startle victims on the other side
-        util.ScreenShake(tr.HitPos, 15, 100, 1.0, 500)
-        
-        -- Stomp impact noises
-        door:EmitSound("physics/wood/wood_solid_break2.wav", 100, 75)
-        door:EmitSound("physics/body/body_medium_break3.wav", 95, 60)
-        
-        -- Flysplinters
-        local ed = EffectData()
-        ed:SetOrigin(tr.HitPos)
-        ed:SetNormal(aimForce)
-        util.Effect("WoodScratch", ed, true, true)
-
-        -- Twice as forceful to slam it out of the frame
-        hgBlastThatDoor(door, aimForce * 600)
+        hgBlastThatDoor(tr.Entity, ply:GetAimVector() * 250)
     end
 end
 
@@ -470,44 +488,17 @@ local function TryBashDoor(ply)
     local dir = vel:GetNormalized()
     if vel:Length2D() < DOOR_BASH_MIN_SPEED then return end
 
-    local hitPos = ply:GetPos() + Vector(0, 0, 40)
-    
     local tr = util.TraceHull({
-        start  = hitPos,
-        endpos = hitPos + dir * 40,
+        start  = ply:GetPos() + Vector(0, 0, 40),
+        endpos = ply:GetPos() + Vector(0, 0, 40) + dir * 40,
         filter = { ply, hg.GetCurrentCharacter(ply) },
         mins   = -Vector(16, 16, 24),
         maxs   = Vector(16, 16, 24),
     })
 
     if tr.Hit and IsValid(tr.Entity) and hgIsDoor(tr.Entity) then
-        local door = tr.Entity
-        local impactPos = tr.HitPos
-        local bashForce = dir * 500 + Vector(0, 0, 100) 
-        
-        hgBlastThatDoor(door, bashForce)
+        hgBlastThatDoor(tr.Entity, dir * 400)
         ply.CrusherDoorBashCooldown = CurTime() + DOOR_BASH_COOLDOWN
-		
-        -- Terrifying Earthquake: Disrupts anyone hiding in the room
-        util.ScreenShake(impactPos, 22, 250, 1.3, 750)
-
-        -- 3-Part Audio Threat (Wood smash + Solid snap + Low Bass "Thump")
-        door:EmitSound("physics/wood/wood_box_break" .. math.random(1, 2) .. ".wav", 100, 70)
-        door:EmitSound("physics/wood/wood_solid_break1.wav", 100, 60)
-        door:EmitSound("ambient/explosions/explode_8.wav", 85, 140, 0.8) -- Adds that gut-punch movie boom feeling
-
-        -- Spit physical particles inside the room (implies catastrophic splintering)
-        local ed = EffectData()
-        ed:SetOrigin(impactPos)
-        ed:SetNormal(dir)
-        ed:SetMagnitude(4)
-        ed:SetScale(2)
-        ed:SetRadius(4)
-        util.Effect("WoodScratch", ed, true, true)
-        
-        -- Turn the door itself into an absolute weapon. 
-        -- An entity shot out at this speed becomes a deadly projectile.
-        
     end
 end
 
@@ -523,6 +514,8 @@ if SERVER then
     util.AddNetworkString("HMCD_Crusher_NeckBreakStop")
     util.AddNetworkString("HMCD_Crusher_ChokeRequest")
     util.AddNetworkString("HMCD_Crusher_ForceLook")
+    util.AddNetworkString("HMCD_Crusher_SecondGrabRequest")
+    util.AddNetworkString("HMCD_BeingVictimOfSecondGrab")
 
     net.Receive("HMCD_Strangler_CrushRequest", function(len, ply)
         if not IsValid(ply) or not ply:Alive() then return end
@@ -570,6 +563,24 @@ if SERVER then
         else
             StartChoking(ply, grab.Victim)
         end
+    end)
+
+    net.Receive("HMCD_Crusher_SecondGrabRequest", function(len, ply)
+        if not IsValid(ply) or not ply:Alive() then return end
+        if not IsCrusher(ply) then return end
+
+        local grab = ply.Ability_HeadGrab
+        if not (grab and grab.Grabbed) then return end -- need a primary victim first
+        if ply.Ability_SecondGrab then return end       -- one free hand, one second grab
+
+        local aim_ent, other_ply = GetCrusherTrace(ply, CRUSHER_REACH)
+        if not (IsValid(aim_ent) and other_ply and CanGrabTarget(aim_ent, other_ply)) then return end
+        if other_ply == grab.Victim then return end -- already got this one
+        if other_ply.Ability_HeadGrab or other_ply.BeingVictimOfHeadGrab
+            or other_ply.BeingVictimOfCrusherSecondGrab then return end -- already someone's victim
+
+        StartSecondGrab(ply, other_ply)
+        DisarmOther(ply, other_ply)
     end)
 
     local boneToLimbFunc = {
@@ -666,7 +677,7 @@ if SERVER then
     local STRUGGLE_MIN_STAMINA  = 20   -- too exhausted to fight back below this
     local STRUGGLE_ESCAPE_HITS  = 8    -- mashes inside the window needed to break free
 
-    local function HandleGripStruggle(ply, victim)
+    local function HandleGripStruggle(ply, victim, releaseFn)
         if not victim:KeyPressed(IN_USE) then return false end
         if (victim.CrusherStruggleCooldown or 0) > CurTime() then return false end
 
@@ -690,7 +701,7 @@ if SERVER then
         if victim.CrusherStruggleHits >= STRUGGLE_ESCAPE_HITS then
             victim.CrusherStruggleHits = 0
             ply:ViewPunch(Angle(-6, math.Rand(-8, 8), 0))
-            StopGrabbingHead(ply)
+            releaseFn(ply)
             return true
         end
 
@@ -757,7 +768,7 @@ if SERVER then
             else
                 if victim:Alive() and victim.organism then
                     victim.organism.choking = true
-                    if HandleGripStruggle(ply, victim) then return end
+                    if HandleGripStruggle(ply, victim, StopGrabbingHead) then return end
                     if zb then
                         local dmgInfo = DamageInfo()
                         dmgInfo:SetAttacker(ply)
@@ -769,6 +780,24 @@ if SERVER then
                         ply:Notify("They seem unresponsive.", 60, "choked" .. victim:EntIndex())
                     end
                 end
+            end
+        end
+
+        local second_data = ply.Ability_SecondGrab
+        if second_data then
+            local victim2     = second_data.Victim
+            local graceOver2  = (second_data.GrabbedAt or 0) + 0.5 < CurTime()
+            local stillHeld2  = IsValid(victim2) and victim2:Alive()
+
+            if stillHeld2 and graceOver2 then
+                local dist = ply:GetShootPos():Distance(victim2:GetPos())
+                if dist > CRUSHER_REACH * 3 then stillHeld2 = false end
+            end
+
+            if not stillHeld2 then
+                StopSecondGrab(ply)
+            elseif HandleGripStruggle(ply, victim2, StopSecondGrab) then
+                return
             end
         end
 
@@ -791,6 +820,13 @@ if SERVER then
 
     hook.Add("HG_MovementCalc_2", "Crusher_SA_Abilities", function(mul, ply)
         if ply.BeingVictimOfHeadGrab then mul[1] = mul[1] * 0.2 end
+        if ply.BeingVictimOfCrusherSecondGrab then mul[1] = mul[1] * 0.25 end
+    end)
+
+    hook.Add("HG_MovementCalc_2", "Crusher_SA_SecondGrabPenalty", function(mul, ply)
+        if IsCrusher(ply) and ply.Ability_HeadGrab and ply.Ability_HeadGrab.Grabbed and ply.Ability_SecondGrab then
+            mul[1] = mul[1] * 0.7 -- dragging two people slows him down too, real risk for the payoff
+        end
     end)
 
     -- к мертвецам либо хорошо, либо никак
@@ -1019,6 +1055,12 @@ if CLIENT then
         BeingVictimOfHeadGrabResetTime = status and (CurTime() + 5) or nil
     end)
 
+    net.Receive("HMCD_BeingVictimOfSecondGrab", function()
+        local status = net.ReadBool()
+        LocalPlayer().BeingVictimOfCrusherSecondGrab = status
+        BeingVictimOfSecondGrabResetTime = status and (CurTime() + 5) or nil
+    end)
+
     -- Forced look: the instant you get grabbed, your view snaps toward
     -- whoever grabbed you for a brief moment, then lets go and gives your
     -- mouse back. Hooks the real engine InputMouseApply event directly so
@@ -1117,6 +1159,11 @@ if CLIENT then
             ply.BeingVictimOfHeadGrab = false
         end
 
+        if BeingVictimOfSecondGrabResetTime and BeingVictimOfSecondGrabResetTime <= CurTime() then
+            BeingVictimOfSecondGrabResetTime = nil
+            ply.BeingVictimOfCrusherSecondGrab = false
+        end
+
         if ply.Ability_HeadGrab then ContinueGrabbingHead(ply) end
     end)
 
@@ -1134,6 +1181,15 @@ if CLIENT then
         if not IsCrusher(ply) then return end
         if ply.Ability_HeadGrab and ply.Ability_HeadGrab.Grabbed then
             net.Start("HMCD_Crusher_ChokeRequest")
+            net.SendToServer()
+        end
+    end)
+
+    concommand.Add("crusher_second_grab", function(ply, cmd, args)
+        if not IsValid(ply) or not ply:Alive() then return end
+        if not IsCrusher(ply) then return end
+        if ply.Ability_HeadGrab and ply.Ability_HeadGrab.Grabbed then
+            net.Start("HMCD_Crusher_SecondGrabRequest")
             net.SendToServer()
         end
     end)
