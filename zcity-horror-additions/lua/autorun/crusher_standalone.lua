@@ -11,6 +11,7 @@ local CRUSHER_REACH      = 85
 local CRUSHER_NECK_REACH = 90
 -- local CRUSHER_HP_MUL     = 10
 local CRUSHER_BASE_HP    = 100
+local GRAB_FORCE_LOOK_DURATION = 0.45 -- seconds the victim is forced to face the crusher right when grabbed
 
 if not ConVarExists("zb_zh_crusher_hpmul") then
     CreateConVar("zb_zh_crusher_hpmul", "10", FCVAR_ARCHIVE + FCVAR_REPLICATED,
@@ -137,13 +138,15 @@ local function StopGrabbingHead(ply)
     ply.Ability_Choke = nil
 end
 
--- Choking: a slow(ish) kill available only while a victim is actively
--- being head-grabbed (ALT+E). Roughly a middle ground in speed between
--- the instant head-crush/neck-break finishers.
-local CHOKE_RATE = 22 -- progress % per second -> ~4.5s to kill
+-- Choking: available only while a victim is actively being head-grabbed
+-- (ALT+E). Instead of a scripted kill timer, this rips the victim's own
+-- oxygen (org.o2[1]) out fast. What happens next -- fainting, brain
+-- damage, death -- plays out through the same organism/lungs simulation
+-- every other suffocation case uses, just sped way up.
+local CHOKE_O2_DRAIN_RATE = 6 -- extra O2 stripped per second (org.o2.range is 30, so a full tank empties in ~5s of holding)
 
 local function StartChoking(ply, victim)
-    ply.Ability_Choke = { Victim = victim, Progress = 0 }
+    ply.Ability_Choke = { Victim = victim }
 end
 
 local function StopChoking(ply)
@@ -158,18 +161,14 @@ local function ContinueChoking(ply)
     local grab = ply.Ability_HeadGrab
     local stillGrabbing = grab and grab.Grabbed and grab.Victim == victim
 
-    if not IsValid(victim) or not victim:Alive() or not stillGrabbing then
+    if not IsValid(victim) or not victim:Alive() or not stillGrabbing or not victim.organism then
         StopChoking(ply)
         return
     end
 
-    choke_data.Progress = choke_data.Progress + FrameTime() * CHOKE_RATE
-
-    if choke_data.Progress >= 100 then
-        victim:Kill()
-        ply.CrusherInjectReload = CurTime() + 0.15
-        StopChoking(ply)
-    end
+    local org = victim.organism
+    org.choking = true
+    org.o2[1] = math.max(org.o2[1] - FrameTime() * CHOKE_O2_DRAIN_RATE, 0)
 end
 
 local function ContinueGrabbingHead(ply)
@@ -199,6 +198,13 @@ local function ContinueGrabbingHead(ply)
     grab_data.Grabbed = true
     grab_data.GrabbedAt = CurTime()
     if SERVER then
+        victim:Notify("Mash E to fight the grip!", 30, "crusher_struggle_hint", 0)
+
+        net.Start("HMCD_Crusher_ForceLook")
+        net.WriteEntity(ply)
+        net.WriteFloat(GRAB_FORCE_LOOK_DURATION)
+        net.Send(victim)
+
         net.Start("HMCD_GrabConfirmed")
         net.WriteBool(true)
         net.WriteEntity(victim)
@@ -428,8 +434,80 @@ local function blastThatShit(ply)
         mins   = -Vector(5, 5, 5),
         maxs   = Vector(5, 5, 5),
     })
+    
     if tr.Hit and IsValid(tr.Entity) and hgIsDoor(tr.Entity) then
-        hgBlastThatDoor(tr.Entity, ply:GetAimVector() * 250)
+        local door = tr.Entity
+        local aimForce = ply:GetAimVector()
+        
+        -- Startle victims on the other side
+        util.ScreenShake(tr.HitPos, 15, 100, 1.0, 500)
+        
+        -- Stomp impact noises
+        door:EmitSound("physics/wood/wood_solid_break2.wav", 100, 75)
+        door:EmitSound("physics/body/body_medium_break3.wav", 95, 60)
+        
+        -- Flysplinters
+        local ed = EffectData()
+        ed:SetOrigin(tr.HitPos)
+        ed:SetNormal(aimForce)
+        util.Effect("WoodScratch", ed, true, true)
+
+        -- Twice as forceful to slam it out of the frame
+        hgBlastThatDoor(door, aimForce * 600)
+    end
+end
+
+-- Running into a door bodily (not kicking, just barreling through it)
+-- rips it off its hinges too, provided the crusher's actually moving fast
+-- enough for it to count as a run.
+local DOOR_BASH_MIN_SPEED = 220 -- ~run speed threshold, walking won't trigger it
+local DOOR_BASH_COOLDOWN  = 0.5
+
+local function TryBashDoor(ply)
+    if (ply.CrusherDoorBashCooldown or 0) > CurTime() then return end
+
+    local vel = ply:GetVelocity()
+    local dir = vel:GetNormalized()
+    if vel:Length2D() < DOOR_BASH_MIN_SPEED then return end
+
+    local hitPos = ply:GetPos() + Vector(0, 0, 40)
+    
+    local tr = util.TraceHull({
+        start  = hitPos,
+        endpos = hitPos + dir * 40,
+        filter = { ply, hg.GetCurrentCharacter(ply) },
+        mins   = -Vector(16, 16, 24),
+        maxs   = Vector(16, 16, 24),
+    })
+
+    if tr.Hit and IsValid(tr.Entity) and hgIsDoor(tr.Entity) then
+        local door = tr.Entity
+        local impactPos = tr.HitPos
+        local bashForce = dir * 500 + Vector(0, 0, 100) 
+        
+        hgBlastThatDoor(door, bashForce)
+        ply.CrusherDoorBashCooldown = CurTime() + DOOR_BASH_COOLDOWN
+		
+        -- Terrifying Earthquake: Disrupts anyone hiding in the room
+        util.ScreenShake(impactPos, 22, 250, 1.3, 750)
+
+        -- 3-Part Audio Threat (Wood smash + Solid snap + Low Bass "Thump")
+        door:EmitSound("physics/wood/wood_box_break" .. math.random(1, 2) .. ".wav", 100, 70)
+        door:EmitSound("physics/wood/wood_solid_break1.wav", 100, 60)
+        door:EmitSound("ambient/explosions/explode_8.wav", 85, 140, 0.8) -- Adds that gut-punch movie boom feeling
+
+        -- Spit physical particles inside the room (implies catastrophic splintering)
+        local ed = EffectData()
+        ed:SetOrigin(impactPos)
+        ed:SetNormal(dir)
+        ed:SetMagnitude(4)
+        ed:SetScale(2)
+        ed:SetRadius(4)
+        util.Effect("WoodScratch", ed, true, true)
+        
+        -- Turn the door itself into an absolute weapon. 
+        -- An entity shot out at this speed becomes a deadly projectile.
+        
     end
 end
 
@@ -444,6 +522,7 @@ if SERVER then
     util.AddNetworkString("HMCD_Crusher_NeckBreakRequest")
     util.AddNetworkString("HMCD_Crusher_NeckBreakStop")
     util.AddNetworkString("HMCD_Crusher_ChokeRequest")
+    util.AddNetworkString("HMCD_Crusher_ForceLook")
 
     net.Receive("HMCD_Strangler_CrushRequest", function(len, ply)
         if not IsValid(ply) or not ply:Alive() then return end
@@ -575,9 +654,54 @@ if SERVER then
         limbFunc(victim.organism, victim)
     end
 
+    -- Grip fatigue: the victim can mash +use to fight the grab. It usually
+    -- won't save them, but every mash burns their own stamina and air, and
+    -- shakes the screen for both sides -- an active struggle instead of a
+    -- progress bar they just watch tick down. Enough mashes fast enough
+    -- and they do break free, but they have to be fresh enough to manage it.
+    local STRUGGLE_STAMINA_COST = 12   -- per mash (org.stamina.max is ~180)
+    local STRUGGLE_O2_COST      = 0.8  -- extra O2 per mash, stacks with any active choke drain
+    local STRUGGLE_MIN_INTERVAL = 0.08 -- guards against turbo-bind macros
+    local STRUGGLE_WINDOW       = 1.3  -- mash streak resets if you stop for this long
+    local STRUGGLE_MIN_STAMINA  = 20   -- too exhausted to fight back below this
+    local STRUGGLE_ESCAPE_HITS  = 8    -- mashes inside the window needed to break free
+
+    local function HandleGripStruggle(ply, victim)
+        if not victim:KeyPressed(IN_USE) then return false end
+        if (victim.CrusherStruggleCooldown or 0) > CurTime() then return false end
+
+        local org = victim.organism
+        if not org or not org.stamina or org.stamina[1] < STRUGGLE_MIN_STAMINA then return false end
+
+        victim.CrusherStruggleCooldown = CurTime() + STRUGGLE_MIN_INTERVAL
+
+        if (victim.CrusherStruggleWindowEnds or 0) < CurTime() then
+            victim.CrusherStruggleHits = 0
+        end
+        victim.CrusherStruggleHits       = (victim.CrusherStruggleHits or 0) + 1
+        victim.CrusherStruggleWindowEnds = CurTime() + STRUGGLE_WINDOW
+
+        org.stamina[1] = math.max(org.stamina[1] - STRUGGLE_STAMINA_COST, 0)
+        org.o2[1]      = math.max(org.o2[1] - STRUGGLE_O2_COST, 0)
+
+        victim:ViewPunch(AngleRand(-3, 3))
+        ply:ViewPunch(AngleRand(-1, 1))
+
+        if victim.CrusherStruggleHits >= STRUGGLE_ESCAPE_HITS then
+            victim.CrusherStruggleHits = 0
+            ply:ViewPunch(Angle(-6, math.Rand(-8, 8), 0))
+            StopGrabbingHead(ply)
+            return true
+        end
+
+        return false
+    end
+
     hook.Add("PlayerPostThink", "Crusher_SA_Abilities", function(ply)
         if not ply:Alive() then return end
         if not IsCrusher(ply) then return end
+
+        TryBashDoor(ply)
 
         if ply.Ability_NeckBreak then ContinueBreakingNeck(ply) end
         if ply.Ability_Choke then ContinueChoking(ply) end
@@ -633,6 +757,7 @@ if SERVER then
             else
                 if victim:Alive() and victim.organism then
                     victim.organism.choking = true
+                    if HandleGripStruggle(ply, victim) then return end
                     if zb then
                         local dmgInfo = DamageInfo()
                         dmgInfo:SetAttacker(ply)
@@ -684,6 +809,7 @@ if SERVER then
     end)
 
     hook.Add("PlayerDisconnected", "Crusher_SA_Abilities", function(ply)
+        StopChoking(ply)
         StopGrabbingHead(ply)
         StopBreakingNeck(ply)
     end)
@@ -891,6 +1017,48 @@ if CLIENT then
         local status = net.ReadBool()
         LocalPlayer().BeingVictimOfHeadGrab = status
         BeingVictimOfHeadGrabResetTime = status and (CurTime() + 5) or nil
+    end)
+
+    -- Forced look: the instant you get grabbed, your view snaps toward
+    -- whoever grabbed you for a brief moment, then lets go and gives your
+    -- mouse back. Hooks the real engine InputMouseApply event directly so
+    -- it works regardless of anything else touching the camera.
+    local forceLook = nil -- { target = Entity, endTime = number }
+
+    net.Receive("HMCD_Crusher_ForceLook", function()
+        local attacker = net.ReadEntity()
+        local duration  = net.ReadFloat()
+        if not IsValid(attacker) then return end
+        forceLook = { target = attacker, endTime = CurTime() + duration }
+    end)
+
+    hook.Add("InputMouseApply", "Crusher_ForceLookAtGrabber", function(cmd, x, y, ang)
+        if not forceLook then return end
+        if not IsValid(forceLook.target) or CurTime() >= forceLook.endTime then
+            forceLook = nil
+            return
+        end
+
+        local ply = LocalPlayer()
+        if not IsValid(ply) or not ply:Alive() then
+            forceLook = nil
+            return
+        end
+
+        local dir = (forceLook.target:EyePos() - ply:EyePos()):GetNormalized()
+        local wantAngle = dir:Angle()
+
+        -- Ease toward the target angle instead of snapping, still reads as
+        -- forced but doesn't whiplash/nauseate the victim.
+        local frac  = math.Clamp(FrameTime() * 12, 0, 1)
+        local final = Angle(
+            math.ApproachAngle(ang.pitch, wantAngle.pitch, frac * 180),
+            math.ApproachAngle(ang.yaw, wantAngle.yaw, frac * 180),
+            0
+        )
+
+        cmd:SetViewAngles(final)
+        return true
     end)
 
     net.Receive("HMCD_GrabbingHead", function()
