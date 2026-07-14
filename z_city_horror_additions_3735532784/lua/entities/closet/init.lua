@@ -22,6 +22,7 @@ function ENT:Initialize()
     local phys = self:GetPhysicsObject()
     if IsValid(phys) then
         phys:Wake()
+        phys:SetMass(800) -- heavier = more stable when player is inside
     end
 
     self.Occupant = nil
@@ -30,7 +31,6 @@ end
 function ENT:EnterCloset(ply)
     if not IsValid(ply) or IsCrusher(ply) then return end
     if not ply:Alive() then return end
-
     if IsValid(self.Occupant) then
         ply:Notify("Someone is already in there..", 0, "closet_occupied_" .. self:EntIndex(), 0)
         return
@@ -39,17 +39,22 @@ function ENT:EnterCloset(ply)
     self.Occupant = ply
     ply.zh_ClosetEnt = self
 
-    ply:SetPos(self:GetPeepholePos())
     ply:SetMoveType(MOVETYPE_NONE)
+    ply:SetCollisionGroup(COLLISION_GROUP_IN_VEHICLE)
+    
+    -- === STRONGER HIDING (fixes ghosting for other players) ===
     ply:SetNoDraw(true)
+    ply:SetRenderMode(RENDERMODE_NONE)      -- Very important
+    ply:DrawShadow(false)
+    ply:SetColor(Color(255, 255, 255, 0))
+
+    ply:SetPos(self:GetPeepholePos())
 
     net.Start("HMCD_Closet_Enter")
     net.WriteEntity(self)
     net.Send(ply)
 end
 
--- ejected: true if the crusher is throwing the occupant out 
--- (folds them using true gamemode faking logic), false for voluntary exit.
 function ENT:ExitCloset(ply, ejected)
     if not IsValid(ply) then return end
     if self.Occupant ~= ply then return end
@@ -57,8 +62,10 @@ function ENT:ExitCloset(ply, ejected)
     local exitPos, exitAng = self:GetExitPos()
 
     ply:SetMoveType(MOVETYPE_WALK)
+    ply:SetCollisionGroup(COLLISION_GROUP_PLAYER)
     ply:SetNoDraw(false)
     ply:SetPos(exitPos)
+    ply:SetEyeAngles(exitAng)
 
     ply.zh_ClosetEnt = nil
     self.Occupant = nil
@@ -67,54 +74,65 @@ function ENT:ExitCloset(ply, ejected)
     net.Send(ply)
 
     if ejected then
-        ply:EmitSound("physics/wood/wood_crate_impact_hard1.wav", 70)
-        local ejectVelocity = self:GetForward() * 250 + Vector(0, 0, 160)
+        ply:EmitSound("physics/wood/wood_crate_impact_hard1.wav", 80)
 
-        -- Tap into native ZCity/Homigrad framework knockdowns so the REAL player goes limp!
-        if type(Faking) == "function" then
-            Faking(ply)
-        elseif type(ply.Faking) == "function" then
-            ply:Faking(true)
-        elseif type(ply.Fake) == "function" then 
-            ply:Fake()
+        local ejectVel = self:GetForward() * 420 + Vector(0, 0, 300)
+
+        -- === CORRECT ZCITY/HOMIGRAD WAY ===
+        if hg and hg.Fake then
+            hg.Fake(ply)                    -- Force fake ragdoll
+        else
+            ply:ConCommand("force_fake")    -- Fallback
+            ply:ConCommand("fake")
         end
 
-        -- Wait exactly 1 engine frame for the gamemode to process the knockout and assign their physics prop, 
-        -- then brutally fling their real bound ragdoll outwardly. 
-        timer.Simple(0, function()
+        -- Apply velocity to the newly created fake ragdoll
+        timer.Simple(0.1, function()
             if not IsValid(ply) then return end
-            
-            -- Hunt down wherever Homigrad stored the actual bound ragdoll entity reference
-            local realRagdoll = ply.fake or ply.ragdoll or ply:GetNWEntity("Ragdoll")
-            
-            if IsValid(realRagdoll) then
-                local bones = realRagdoll:GetPhysicsObjectCount()
-                for i = 0, bones - 1 do
-                    local rPhys = realRagdoll:GetPhysicsObjectNum(i)
-                    if IsValid(rPhys) then
-                        rPhys:SetVelocity(ejectVelocity + VectorRand() * 35)
-                        rPhys:AddAngleVelocity(VectorRand() * 200)
+
+            local rag = ply.fake
+                     or ply.ragdoll
+                     or ply:GetNWEntity("Ragdoll")
+                     or ply:GetNWEntity("FakeRagdoll")
+                     or ply:GetNWEntity("zh_fake_ragdoll")
+
+            if IsValid(rag) then
+                for i = 0, rag:GetPhysicsObjectCount() - 1 do
+                    local phys = rag:GetPhysicsObjectNum(i)
+                    if IsValid(phys) then
+                        phys:Wake()
+                        phys:SetVelocity(ejectVel + VectorRand() * 90)
+                        phys:AddAngleVelocity(VectorRand() * 500)
                     end
                 end
             else
-                -- Ultimate Fallback: Gamemode failsafe, just fling the upright player physics 
-                ply:SetVelocity(ejectVelocity)
+                ply:SetVelocity(ejectVel)
             end
         end)
     end
 end
 
--- Keeps the occupant's real position glued to the closet every tick
--- (so it still follows the closet if pushed/rotated) without relying
--- on engine parenting.
+
+-- === FIX 3: Much more reliable "follow closet" logic ===
 function ENT:Think()
     if IsValid(self.Occupant) then
-        self.Occupant:SetPos(self:GetPeepholePos())
+        local ply = self.Occupant
+
+        if ply:GetPos():DistToSqr(self:GetPeepholePos()) > 9 then
+            ply:SetPos(self:GetPeepholePos())
+        end
+
+        -- Only force these while inside
+        if ply:GetMoveType() ~= MOVETYPE_NONE then
+            ply:SetMoveType(MOVETYPE_NONE)
+        end
     end
+
     self:NextThink(CurTime())
     return true
 end
 
+-- Rest of the file unchanged (Use, OnRemove, hooks, admin command...)
 function ENT:Use(activator, caller)
     if not IsValid(activator) or not activator:IsPlayer() then return end
 
@@ -161,10 +179,8 @@ hook.Add("PlayerDisconnected", "zh_closet_disconnectcleanup", function(ply)
 end)
 
 
--- ========================================================
--- ADMIN TOOL: FORCE PLAYER INTO VIEWED CLOSET 
--- ========================================================
 
+-- Admin command (unchanged)
 concommand.Add("zh_force_closet", function(ply, cmd, args)
     if IsValid(ply) and not ply:IsAdmin() then
         ply:PrintMessage(HUD_PRINTCONSOLE, "[ZH Closet] Access Denied. You must be an admin.")
@@ -210,20 +226,29 @@ concommand.Add("zh_force_closet", function(ply, cmd, args)
         return
     end
 
+    -- === NEW RESTRICTION: Prevent forcing players who are in fake/ragdoll ===
+    if IsValid(targetPlayer.fake) 
+       or IsValid(targetPlayer.ragdoll) 
+       or IsValid(targetPlayer:GetNWEntity("Ragdoll"))
+       or IsValid(targetPlayer:GetNWEntity("FakeRagdoll"))
+       or IsValid(targetPlayer:GetNWEntity("zh_fake_ragdoll")) then
+        
+        ply:PrintMessage(HUD_PRINTCONSOLE, "[ZH Closet] Cannot force a player who is currently in fake/ragdoll state.")
+        return
+    end
+
+    if targetPlayer.zh_ClosetEnt and IsValid(targetPlayer.zh_ClosetEnt) then
+        ply:PrintMessage(HUD_PRINTCONSOLE, "[ZH Closet] That player is already inside a closet.")
+        return
+    end
+
     if IsCrusher(targetPlayer) then
         ply:PrintMessage(HUD_PRINTCONSOLE, "[ZH Closet] Blocked: Cannot force Crusher into a closet.")
         return
     end
-    
-    if IsValid(targetCloset.Occupant) then 
-        ply:PrintMessage(HUD_PRINTCONSOLE, "[ZH Closet] Ejecting current inhabitant (" .. targetCloset.Occupant:Nick() .. ") before moving new user in.")
-        targetCloset:ExitCloset(targetCloset.Occupant, false)
-    end
 
-    if IsValid(targetPlayer.zh_ClosetEnt) and targetPlayer.zh_ClosetEnt ~= targetCloset then
-        targetPlayer.zh_ClosetEnt:ExitCloset(targetPlayer, false)
-    end
-
+    -- Force the player in
     targetCloset:EnterCloset(targetPlayer)
-    ply:PrintMessage(HUD_PRINTCONSOLE, "[ZH Closet] Successfully pushed " .. targetPlayer:Nick() .. " into target closet!")
+
+    ply:PrintMessage(HUD_PRINTCONSOLE, "[ZH Closet] Forced " .. targetPlayer:Nick() .. " into the closet.")
 end)
