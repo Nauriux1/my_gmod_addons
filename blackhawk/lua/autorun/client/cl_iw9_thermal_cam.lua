@@ -634,9 +634,7 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     cam.shakeR = math.sin(t * 13.2) * amp * 0.20
 
     local heatLoad = math.Clamp(#haloTargets / 6, 0, 1)
-    local smear = math.Clamp(slewMag / math.max(maxRate, 1), 0, 1) * 0.35
-    local targetBloom = math.Clamp(heatLoad * 0.75 + smear, 0, 1)
-    cam.bloom = Lerp(math.min(1, 4 * dt), cam.bloom, targetBloom)
+    
 end)
 
 hook.Add("Think", "iw9_ThermalCam.Zoom", function()
