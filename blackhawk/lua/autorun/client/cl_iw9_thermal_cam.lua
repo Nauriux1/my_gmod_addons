@@ -34,6 +34,10 @@ local GIMBAL_LOCAL_OFFSET = Vector(100, -10, -50) -- belly-mounted; tune in-game
 local FOV_BASE, FOV_MIN = 50, 15
 local DETECT_RANGE = 4000
 
+-- One press → one toggle. Prevents the old KeyPressed race that either
+-- ate the click or double-fired depending on frame timing / other hooks.
+local TOGGLE_COOLDOWN = 0.45
+
 -- Camera bounding settings to avoid Near-Z visual clipping against ground/walls.
 local CAM_HULL_RADIUS   = 6
 local CAM_COLLISION_MIN = Vector(-CAM_HULL_RADIUS, -CAM_HULL_RADIUS, -CAM_HULL_RADIUS)
@@ -112,6 +116,8 @@ local cam = {
 
     -- Thermal blooming intensity 0..1 (driven by on-screen heat)
     bloom     = 0,
+
+    nextToggle = 0,
 }
 
 local haloTargets = {}
@@ -167,6 +173,32 @@ local function StopThermalCam()
     RestoreGlideCameraHooks()
 end
 
+local function StartThermalCam()
+    if cam.active then return end
+    if not CanUseThermalCam() then return end
+
+    local vehAng = cam.vehicle:GetAngles()
+    cam.active    = true
+    cam.cmdYaw    = vehAng.y
+    cam.cmdPitch  = 20
+    cam.yaw       = vehAng.y
+    cam.pitch     = 20
+    cam.roll      = 0
+    cam.rateYaw   = 0
+    cam.ratePitch = 0
+    cam.precYaw   = 0
+    cam.precPitch = 0
+    cam.joltYaw   = 0
+    cam.joltPitch = 0
+    cam.fov       = FOV_BASE
+    cam.lastZoom  = false
+    cam.bloom     = 0
+    cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
+    cam.shakeP, cam.shakeY, cam.shakeR = 0, 0, 0
+    SuppressGlideCameraHooks()
+    surface.PlaySound("buttons/button24.wav")
+end
+
 local function GetSafeCameraOrigin(vehicle)
     if not IsValid(vehicle) then return Vector() end
 
@@ -208,64 +240,98 @@ local function AngleDiffDeg(a, b)
     return d
 end
 
+local function IsUnarmed(ply)
+    local wep = ply:GetActiveWeapon()
+    if not IsValid(wep) then return true end
+
+    local cls = wep:GetClass()
+    -- Hands / holstered style weapons used by Homigrad & common bases.
+    if cls == "weapon_hands_sh"
+    or cls == "weapon_hands"
+    or cls == "weapon_fists"
+    or cls == "none"
+    or cls == "weapon_crowbar" and false -- keep explicit
+    then
+        return true
+    end
+
+    if string.find(cls, "hands", 1, true) then
+        return true
+    end
+
+    return false
+end
+
 hook.Add("Glide_OnLocalEnterVehicle", "iw9_ThermalCam.Track", function(vehicle, seatIndex)
     cam.vehicle = vehicle
     cam.seatIndex = seatIndex
+    cam.nextToggle = 0
     StopThermalCam()
 end)
 
 hook.Add("Glide_OnLocalExitVehicle", "iw9_ThermalCam.Track", function()
     cam.vehicle = NULL
     cam.seatIndex = nil
+    cam.nextToggle = 0
     StopThermalCam()
 end)
 
-local function CanUseThermalCam()
+function CanUseThermalCam()
     return IsValid(cam.vehicle)
         and SUPPORTED_CLASSES[cam.vehicle:GetClass()]
         and cam.seatIndex == GIMBAL_SEAT
 end
 
-hook.Add("Think", "iw9_ThermalCam.Toggle", function()
-    if not CanUseThermalCam() then
-        if cam.active then StopThermalCam() end
+-- ---------------------------------------------------------------------
+-- Toggle via PlayerBindPress (+attack rising edge)
+--
+-- Why not ply:KeyPressed(IN_ATTACK) in Think?
+--   * KeyPressed is only true for a single frame and is easy to miss when
+--     other systems also touch attack, or when the client stutters.
+--   * It can also appear to "double fire" relative to other hooks, which
+--     felt like instant on/off or requiring spam.
+--
+-- Bind press fires once per physical click, we debounce, and we swallow
+-- the bind so nothing else eats or re-triggers it.
+-- ---------------------------------------------------------------------
+
+hook.Add("PlayerBindPress", "iw9_ThermalCam.Toggle", function(ply, bind, pressed)
+    if not pressed then return end
+    if ply ~= LocalPlayer() then return end
+    if bind ~= "+attack" then return end
+    if not CanUseThermalCam() then return end
+
+    local now = CurTime()
+
+    -- Still cooling down from the last toggle.
+    if now < cam.nextToggle then
+        -- While thermal is up, keep eating attack so spam doesn't leak
+        -- into other vehicle actions; while down, let the click through
+        -- only if we are not the ones handling it.
+        if cam.active then return true end
         return
     end
 
-    local ply = LocalPlayer()
-    if not IsValid(ply) then return end
+    if cam.active then
+        -- Always allow turning OFF, regardless of held weapon.
+        StopThermalCam()
+        surface.PlaySound("buttons/button10.wav")
+        cam.nextToggle = now + TOGGLE_COOLDOWN
+        return true
+    end
 
-    if ply:KeyPressed(IN_ATTACK) then
-        local activeWep = ply:GetActiveWeapon()
-        local isUnarmed = not IsValid(activeWep) or activeWep:GetClass() == "weapon_hands_sh"
-        if not isUnarmed then return end
+    -- Turning ON requires unarmed co-pilot hands.
+    if not IsUnarmed(ply) then return end
 
-        cam.active = not cam.active
+    StartThermalCam()
+    cam.nextToggle = now + TOGGLE_COOLDOWN
+    return true
+end)
 
-        if cam.active then
-            local vehAng = cam.vehicle:GetAngles()
-            cam.cmdYaw    = vehAng.y
-            cam.cmdPitch  = 20
-            cam.yaw       = vehAng.y
-            cam.pitch     = 20
-            cam.roll      = 0
-            cam.rateYaw   = 0
-            cam.ratePitch = 0
-            cam.precYaw   = 0
-            cam.precPitch = 0
-            cam.joltYaw   = 0
-            cam.joltPitch = 0
-            cam.fov       = FOV_BASE
-            cam.lastZoom  = false
-            cam.bloom     = 0
-            cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
-            cam.shakeP, cam.shakeY, cam.shakeR = 0, 0, 0
-            SuppressGlideCameraHooks()
-            surface.PlaySound("buttons/button24.wav")
-        else
-            RestoreGlideCameraHooks()
-            surface.PlaySound("buttons/button10.wav")
-        end
+-- Safety: if we somehow leave the valid seat while active, shut down.
+hook.Add("Think", "iw9_ThermalCam.Safety", function()
+    if cam.active and not CanUseThermalCam() then
+        StopThermalCam()
     end
 end)
 
