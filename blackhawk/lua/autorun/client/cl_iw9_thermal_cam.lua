@@ -34,19 +34,61 @@ local GIMBAL_LOCAL_OFFSET = Vector(100, -10, -50) -- belly-mounted; tune in-game
 local FOV_BASE, FOV_MIN = 50, 15
 local DETECT_RANGE = 4000
 
--- Camera bounding settings to avoid Near-Z visual clipping against ground/walls. 
+-- Camera bounding settings to avoid Near-Z visual clipping against ground/walls.
 local CAM_HULL_RADIUS   = 6
 local CAM_COLLISION_MIN = Vector(-CAM_HULL_RADIUS, -CAM_HULL_RADIUS, -CAM_HULL_RADIUS)
 local CAM_COLLISION_MAX = Vector(CAM_HULL_RADIUS, CAM_HULL_RADIUS, CAM_HULL_RADIUS)
+
+-- ---------------------------------------------------------------------
+-- Gimbal dynamics (electro-optical turret simulation)
+--
+-- Real belly-mounted FLIR/TADS gimbals are NOT free-look mice:
+--   * motors have max slew rate (slower when zoomed in)
+--   * acceleration is limited (they ramp up / coast to a stop)
+--   * gyros stabilize against airframe motion, but not perfectly
+--   * rotor wash + airframe flex inject micro-vibration (worse at zoom)
+--   * hard slews induce a tiny mechanical roll cant
+-- ---------------------------------------------------------------------
+local SLEW_RATE_WIDE   = 110   -- deg/s max at FOV_BASE
+local SLEW_RATE_NARROW = 18    -- deg/s max at FOV_MIN (telephoto crawl)
+local SLEW_ACCEL       = 420   -- deg/s^2 motor acceleration
+local SETTLE_STIFFNESS = 14    -- spring gain for final approach to target
+local SETTLE_DAMPING   = 9     -- velocity damping on settle
+local STAB_BLEED       = 0.035 -- fraction of airframe angular rate that leaks through
+local VIB_BASE         = 0.04  -- base vibration amplitude (degrees)
+local VIB_SPEED_SCALE  = 0.000035
+local VIB_ZOOM_POWER   = 1.35  -- vibration grows with zoom
+local ROLL_FROM_YAW    = 0.045 -- dynamic roll per (deg/s) of yaw rate
+local ROLL_RETURN      = 6     -- how fast roll settles back to 0
 
 local cam = {
     active    = false,
     vehicle   = NULL,
     seatIndex = nil,
+
+    -- Operator command (where the stick wants to look)
+    cmdYaw    = 0,
+    cmdPitch  = 20,
+
+    -- Actual gimbal pose (what the sensor is pointing at)
     yaw       = 0,
-    pitch     = 0,
+    pitch     = 20,
+    roll      = 0,
+
+    -- Angular rates of the gimbal itself (deg/s)
+    rateYaw   = 0,
+    ratePitch = 0,
+
     fov       = FOV_BASE,
     lastZoom  = false,
+
+    -- Airframe tracking for stabilization bleed
+    prevVehAng = nil,
+
+    -- Composite shake applied on top of the pose each frame
+    shakeP    = 0,
+    shakeY    = 0,
+    shakeR    = 0,
 }
 
 local haloTargets = {}
@@ -97,18 +139,23 @@ end
 local function StopThermalCam()
     if not cam.active then return end
     cam.active = false
+    cam.rateYaw, cam.ratePitch = 0, 0
+    cam.roll = 0
+    cam.shakeP, cam.shakeY, cam.shakeR = 0, 0, 0
+    cam.prevVehAng = nil
     RestoreGlideCameraHooks()
 end
 
 -- ---------------------------------------------------------------------
--- Physical Camera Collision Resolution Helper Functions. 
--- Ensures the view stays entirely clear without peeking beyond map bounds. 
+-- Physical Camera Collision Resolution Helper Functions.
+-- Ensures the view stays entirely clear without peeking beyond map bounds.
 -- ---------------------------------------------------------------------
 local function GetSafeCameraOrigin(vehicle)
     if not IsValid(vehicle) then return Vector() end
 
-    -- Avoid shooting bounding-traces diagonally out from origin through body chunks; 
-    -- instead we spawn safely *inside* above the pod vertically then strictly trace straight downwards to rest it firmly above surfaces/hillsides if clipping 
+    -- Avoid shooting bounding-traces diagonally out from origin through body chunks;
+    -- instead we spawn safely *inside* above the pod vertically then strictly trace
+    -- straight downwards to rest it firmly above surfaces/hillsides if clipping.
     local startWorld = vehicle:LocalToWorld(Vector(GIMBAL_LOCAL_OFFSET.x, GIMBAL_LOCAL_OFFSET.y, 30))
     local idealPos   = vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET)
 
@@ -117,18 +164,17 @@ local function GetSafeCameraOrigin(vehicle)
         endpos = idealPos,
         mins   = CAM_COLLISION_MIN,
         maxs   = CAM_COLLISION_MAX,
-        mask   = MASK_SOLID, -- Will impact Terrain, Physics brushes, & Items
+        mask   = MASK_SOLID,
         filter = function(ent)
             if not IsValid(ent) then return true end
             if ent:IsPlayer() or ent:IsNPC() then return false end
-            
-            -- Prevent bounding collisions on any actual aircraft sub-props, extensions or armament nodes hooked to helicopter entity internally hierarchy trees paths structure trees paths mapping data map mappings layout.
+
             local current = ent
             while IsValid(current) do
                 if current == vehicle then return false end
                 current = current:GetParent()
             end
-            
+
             return true
         end
     })
@@ -136,6 +182,13 @@ local function GetSafeCameraOrigin(vehicle)
     return tr.HitPos
 end
 
+-- Max slew rate interpolates between wide and narrow FOV limits.
+local function GetMaxSlewRate()
+    local t = math.Clamp((cam.fov - FOV_MIN) / (FOV_BASE - FOV_MIN), 0, 1)
+    -- Smoothstep so the crawl-in feels natural as optics tighten.
+    t = t * t * (3 - 2 * t)
+    return Lerp(t, SLEW_RATE_NARROW, SLEW_RATE_WIDE)
+end
 
 -- ---------------------------------------------------------------------
 -- Track current seat via the same events Glide's own camera uses
@@ -176,18 +229,26 @@ hook.Add("Think", "iw9_ThermalCam.Toggle", function()
         -- WEAPON FILTER: Disallow thermal control panel toggle if holding a functional weapon.
         local activeWep = ply:GetActiveWeapon()
         local isUnarmed = not IsValid(activeWep) or activeWep:GetClass() == "weapon_hands_sh"
-        
-        -- Ignore Left Click system control sequence entirely if using anything other than bare hands / hands_sh weapon state
+
         if not isUnarmed then return end
 
         cam.active = not cam.active
 
         if cam.active then
-            -- Start looking straight down whichever way the vehicle's
-            -- currently facing, rather than some arbitrary fixed angle.
+            -- Boot the gimbal looking roughly along the airframe heading,
+            -- slightly nose-down — typical search posture.
             local vehAng = cam.vehicle:GetAngles()
-            cam.yaw, cam.pitch, cam.fov = vehAng.y, 20, FOV_BASE
+            cam.cmdYaw   = vehAng.y
+            cam.cmdPitch = 20
+            cam.yaw      = vehAng.y
+            cam.pitch    = 20
+            cam.roll     = 0
+            cam.rateYaw  = 0
+            cam.ratePitch = 0
+            cam.fov      = FOV_BASE
             cam.lastZoom = false
+            cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
+            cam.shakeP, cam.shakeY, cam.shakeR = 0, 0, 0
             SuppressGlideCameraHooks()
             surface.PlaySound("buttons/button24.wav")
         else
@@ -198,25 +259,122 @@ hook.Add("Think", "iw9_ThermalCam.Toggle", function()
 end)
 
 -- ---------------------------------------------------------------------
--- Mouse look: fully free 360, independent of the vehicle's orientation.
--- Scale sensitivity dynamically inversely to FOV magnitude (Telephoto mode smooth pan tracking interpolation).
+-- Mouse look: operator command only.
+-- Deltas update the *commanded* look direction. The physical gimbal
+-- chases that command in Think with real motor limits — so flinging the
+-- mouse does not teleport the sensor, it just asks the motors to catch up.
+-- Sensitivity scales with FOV so telephoto tracking stays precise.
 -- ---------------------------------------------------------------------
 
 hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
     if not cam.active or not CanUseThermalCam() then return end
 
-    -- Automatically map your pan controls exactly backwards over FOV zooming amounts making lock tracing flawlessly smooth and precise from the distance limits 
-    local currentFovMultiplier = cam.fov / FOV_BASE 
-    local sens = 0.05 * currentFovMultiplier
-    
-    cam.yaw   = (cam.yaw - x * sens) % 360
-    cam.pitch = math.Clamp(cam.pitch + y * sens, -85, 85)
+    local fovMul = cam.fov / FOV_BASE
+    -- Slightly non-linear: very small motions stay fine, big flicks still register.
+    local sens = 0.048 * fovMul
+
+    cam.cmdYaw   = (cam.cmdYaw - x * sens) % 360
+    cam.cmdPitch = math.Clamp(cam.cmdPitch + y * sens, -85, 85)
 
     return true
 end)
 
 -- ---------------------------------------------------------------------
--- Realistic Camera Lens Optical Swapping on Right Click holds + Optics click track noise feedback mechanisms. 
+-- Gimbal servo integration + FOV zoom
+-- Runs every frame while active: motors, stabilization bleed, vibration.
+-- ---------------------------------------------------------------------
+
+local function AngleDiffDeg(a, b)
+    local d = (a - b) % 360
+    if d > 180 then d = d - 360 end
+    return d
+end
+
+hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
+    if not cam.active or not CanUseThermalCam() then return end
+
+    local dt = FrameTime()
+    if dt <= 0 then return end
+    -- Hard cap so a hitch doesn't yeet the gimbal across the sky.
+    dt = math.min(dt, 0.05)
+
+    local vehicle = cam.vehicle
+    local maxRate = GetMaxSlewRate()
+
+    -- --- Error from actual pose to commanded pose ---
+    local errYaw   = AngleDiffDeg(cam.cmdYaw, cam.yaw)
+    local errPitch = cam.cmdPitch - cam.pitch
+
+    -- Desired rates: proportional (spring) toward the command, clamped to max slew.
+    -- When far away this is rate-limited; when close the spring settles smoothly.
+    local desireYaw   = math.Clamp(errYaw   * SETTLE_STIFFNESS, -maxRate, maxRate)
+    local desirePitch = math.Clamp(errPitch * SETTLE_STIFFNESS, -maxRate, maxRate)
+
+    -- Motor acceleration toward desired rates (inertia).
+    local function ApproachRate(current, desire, accel)
+        local delta = desire - current
+        local step  = accel * dt
+        if math.abs(delta) <= step then return desire end
+        return current + math.Clamp(delta, -step, step)
+    end
+
+    cam.rateYaw   = ApproachRate(cam.rateYaw,   desireYaw,   SLEW_ACCEL)
+    cam.ratePitch = ApproachRate(cam.ratePitch, desirePitch, SLEW_ACCEL)
+
+    -- Extra damping so it doesn't oscillate around the target.
+    cam.rateYaw   = cam.rateYaw   * math.max(0, 1 - SETTLE_DAMPING * dt * 0.15)
+    cam.ratePitch = cam.ratePitch * math.max(0, 1 - SETTLE_DAMPING * dt * 0.15)
+
+    -- Integrate pose.
+    cam.yaw   = (cam.yaw + cam.rateYaw * dt) % 360
+    cam.pitch = math.Clamp(cam.pitch + cam.ratePitch * dt, -85, 85)
+
+    -- --- Imperfect gyro stabilization ---
+    -- A real gimbal rejects most airframe motion. A few percent still leaks
+    -- through as residual drift the operator has to correct.
+    local vehAng = vehicle:GetAngles()
+    if cam.prevVehAng then
+        local dPitch = AngleDiffDeg(vehAng.p, cam.prevVehAng.p) / dt
+        local dYaw   = AngleDiffDeg(vehAng.y, cam.prevVehAng.y) / dt
+        local dRoll  = AngleDiffDeg(vehAng.r, cam.prevVehAng.r) / dt
+
+        cam.yaw   = (cam.yaw   + dYaw   * STAB_BLEED * dt) % 360
+        cam.pitch = math.Clamp(cam.pitch + dPitch * STAB_BLEED * dt, -85, 85)
+
+        -- Command drifts with the leak too, so the operator doesn't fight a
+        -- constantly re-opening error when the ship banks steadily.
+        cam.cmdYaw   = (cam.cmdYaw   + dYaw   * STAB_BLEED * dt) % 360
+        cam.cmdPitch = math.Clamp(cam.cmdPitch + dPitch * STAB_BLEED * dt, -85, 85)
+
+        -- Roll disturbance from airframe roll rate (tiny).
+        cam.roll = cam.roll + dRoll * STAB_BLEED * 0.25 * dt
+    end
+    cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
+
+    -- Dynamic roll cant from hard yaw slews (mechanical gimbal coupling),
+    -- then spring back to level.
+    local targetRoll = -cam.rateYaw * ROLL_FROM_YAW
+    cam.roll = Lerp(math.min(1, ROLL_RETURN * dt), cam.roll, targetRoll)
+    cam.roll = math.Clamp(cam.roll, -6, 6)
+
+    -- --- Rotor / airframe vibration ---
+    -- Amplitude grows with airspeed and zoom. Frequencies sit in the
+    -- "helicopter rattle" band so it reads as mechanical, not noise.
+    local speed = vehicle:GetVelocity():Length()
+    local zoomMul = (FOV_BASE / math.max(cam.fov, FOV_MIN)) ^ VIB_ZOOM_POWER
+    local amp = (VIB_BASE + speed * VIB_SPEED_SCALE) * zoomMul
+
+    local t = RealTime()
+    -- Two incommensurate frequencies per axis → organic, non-repeating shake.
+    cam.shakeP = math.sin(t * 17.3) * amp * 0.55
+               + math.sin(t * 29.1) * amp * 0.25
+    cam.shakeY = math.sin(t * 19.7) * amp * 0.45
+               + math.cos(t * 23.4) * amp * 0.30
+    cam.shakeR = math.sin(t * 13.2) * amp * 0.20
+end)
+
+-- ---------------------------------------------------------------------
+-- Realistic Camera Lens Optical Swapping on Right Click hold
 -- ---------------------------------------------------------------------
 
 hook.Add("Think", "iw9_ThermalCam.Zoom", function()
@@ -224,39 +382,40 @@ hook.Add("Think", "iw9_ThermalCam.Zoom", function()
     local ply = LocalPlayer()
     if not IsValid(ply) then return end
 
-    -- Hold Right click mapped for the Telephoto Narrow-Sight tracking engagement 
-    local requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues = ply:KeyDown(IN_ATTACK2)
-    
-    if requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues ~= cam.lastZoom then 
-        surface.PlaySound("thermal/zoomin.ogg") -- Provides hardware simulation sounds matching camera internals re-seating physical optics.
-        cam.lastZoom = requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues
-    end 
-    
-    local fovMagnificationSetSystemOpticLimitsFOVSizeVarsMappingMapValSizeTGTSystemReadOffsetSys = requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues and FOV_MIN or FOV_BASE
-    -- Applies realistic fast servos exponentially dragging on max optic boundaries creating actual smoothness tracking curves compared vs pure linearity models limits rendering framing frames updates calculations 
-    cam.fov = Lerp(math.min(FrameTime() * 8, 1), cam.fov, fovMagnificationSetSystemOpticLimitsFOVSizeVarsMappingMapValSizeTGTSystemReadOffsetSys)
+    local wantZoom = ply:KeyDown(IN_ATTACK2)
+
+    if wantZoom ~= cam.lastZoom then
+        surface.PlaySound("thermal/zoomin.ogg")
+        cam.lastZoom = wantZoom
+    end
+
+    local targetFov = wantZoom and FOV_MIN or FOV_BASE
+    -- Servo-style optic train: fast at first, eases into the stop.
+    cam.fov = Lerp(math.min(FrameTime() * 8, 1), cam.fov, targetFov)
 end)
 
 -- ---------------------------------------------------------------------
 -- The actual camera override
--- Glide's PostPostHGCalcView is removed while we are active, so this
--- hook can run at normal priority and will be the one that supplies the
--- view table.
 -- ---------------------------------------------------------------------
 
 hook.Add("PostPostHGCalcView", "iw9_ThermalCam.CalcView", function()
     if not cam.active or not CanUseThermalCam() then return end
 
     local vehicle = cam.vehicle
-    
-    -- Safe Trace Projection for final Render POV Calculation Rendering Coordinates Offset Position 
-    local viewPointRestSafeCalcRenderingPositionBoundsOutputSysMathVectorResult = GetSafeCameraOrigin(vehicle)
-    
+    local origin  = GetSafeCameraOrigin(vehicle)
+
+    -- Composite final look: gimbal pose + residual shake.
+    local ang = Angle(
+        cam.pitch + cam.shakeP,
+        cam.yaw   + cam.shakeY,
+        cam.roll  + cam.shakeR
+    )
+
     return {
-        origin      = viewPointRestSafeCalcRenderingPositionBoundsOutputSysMathVectorResult,
-        angles      = Angle(cam.pitch, cam.yaw, 0),
-        fov         = cam.fov,
-        drawviewer  = true,
+        origin     = origin,
+        angles     = ang,
+        fov        = cam.fov,
+        drawviewer = true,
     }
 end)
 
@@ -290,7 +449,6 @@ local function GetCharacterEyePos(character)
         return character:EyePos()
     end
 
-    -- prop_ragdoll (FakeRagdoll): prefer eyes attachment, then head bone, else a raised center.
     local attId = character:LookupAttachment("eyes")
     if attId and attId > 0 then
         local att = character:GetAttachment(attId)
@@ -310,17 +468,13 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
     table.Empty(haloTargets)
     if not cam.active or not IsValid(cam.vehicle) then return end
 
-    -- Safe Trace Point Reference Origin matching the current Rendering Position Math Camera System Data Coordinate Mapping Output Math Trace HitPos 
     local origin = GetSafeCameraOrigin(cam.vehicle)
     local me = LocalPlayer()
 
     for _, target in player.Iterator() do
-        -- Never mark the thermal operator or fully dead players.
         if target == me then continue end
         if not target:Alive() then continue end
 
-        -- Living but ragdolled players are represented by their FakeRagdoll;
-        -- standing players are the player entity itself.
         local character = IsValid(target.FakeRagdoll) and target.FakeRagdoll or target
 
         if character:GetPos():DistToSqr(origin) > DETECT_RANGE * DETECT_RANGE then continue end
@@ -339,28 +493,23 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
     end
 
     if #haloTargets > 0 then
-        -- === MILITARY FLIR "WHITE-HOT" HALO ===
-        -- Adds subtle pulse to simulate sensor scan/refresh
-        local pulse = 220 + math.sin(RealTime() * 15) * 35 
-        
-        -- 1. Outer Layer: Soft thermal bleeding/bloom
+        local pulse = 220 + math.sin(RealTime() * 15) * 35
+
+        -- Outer soft thermal bloom
         halo.Add(haloTargets, Color(200, 255, 200, pulse * 0.4), 4, 4, 1, true, false)
-        
-        -- 2. Inner Layer: Solid, intense "White-Hot" signature core
+        -- Inner white-hot core
         halo.Add(haloTargets, Color(pulse, pulse, pulse, 255), 1, 1, 3, true, false)
     end
 end)
 
 -- ---------------------------------------------------------------------
 -- HDTS HUD Layout
--- Full Head-Down Targeting System readout for military-style telemetry.
 -- ---------------------------------------------------------------------
 
 hook.Add("HUDShouldDraw", "iw9_ThermalCam.HideDefaultHUD", function(name)
     if cam.active and name == "CHudCrosshair" then return false end
 end)
 
--- Helper text layout map
 local function HDTS_Text(text, x, y, alignX, alignY, color)
     draw.SimpleText(text, "DermaDefaultBold", x, y, color, alignX or TEXT_ALIGN_LEFT, alignY or TEXT_ALIGN_TOP)
 end
@@ -373,75 +522,68 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     local col    = Color(80, 255, 140, 230)
     local alertCol = Color(255, 140, 80, 230)
 
-    -- Telemetry logic gathering
     local veh = cam.vehicle
     local pos = IsValid(veh) and veh:GetPos() or Vector(0,0,0)
     local vel = IsValid(veh) and veh:GetVelocity() or Vector(0,0,0)
 
-    -- Rough flight conversions -> Height to Ft, speed approx to Knots
-    local alt_feet = math.max(0, pos.z / 12) 
-    local spd_kts  = vel:Length() * 0.05 
-    -- Turning Garry's yaw map standard: convert (+left/-right) onto a descending 360-based Aircraft Compass Scale.
+    local alt_feet = math.max(0, pos.z / 12)
+    local spd_kts  = vel:Length() * 0.05
+    -- Display the *actual* gimbal heading (not the raw command) so the
+    -- tape matches what the sensor is seeing during a slew lag.
     local trueAzimuth = ((-cam.yaw % 360) + 360) % 360
     local isNarrowFov = cam.fov < FOV_BASE - 5
 
-    -- Screen boundary offsets for side panel telemetry
     local sLeft   = h * 0.1
     local sRight  = w - (h * 0.1)
     local bHeight = h - (h * 0.1)
 
-    -- Safe/Target framing central brackets
     local fW, fH = w * 0.65, h * 0.65
     local bx, by = cx - fW / 2, cy - fH / 2
     local bL     = h * 0.05
-    
+
     surface.SetDrawColor(col)
 
     -- Outer bounding field frames
-    surface.DrawLine(bx, by, bx + bL, by)                           -- Top Left L-Bracket
+    surface.DrawLine(bx, by, bx + bL, by)
     surface.DrawLine(bx, by, bx, by + bL)
-    surface.DrawLine(bx + fW, by, bx + fW - bL, by)                 -- Top Right L-Bracket
+    surface.DrawLine(bx + fW, by, bx + fW - bL, by)
     surface.DrawLine(bx + fW, by, bx + fW, by + bL)
-    surface.DrawLine(bx, by + fH, bx + bL, by + fH)                 -- Bottom Left L-Bracket
+    surface.DrawLine(bx, by + fH, bx + bL, by + fH)
     surface.DrawLine(bx, by + fH, bx, by + fH - bL)
-    surface.DrawLine(bx + fW, by + fH, bx + fW - bL, by + fH)       -- Bottom Right L-Bracket
+    surface.DrawLine(bx + fW, by + fH, bx + fW - bL, by + fH)
     surface.DrawLine(bx + fW, by + fH, bx + fW, by + fH - bL)
 
-    -- Sight Inner Pitch Horizon Brackets (Static framing structure simulating M-TADS lock borders)
+    -- Sight inner pitch horizon brackets
     local pbW = w * 0.15
     local pbH = h * 0.06
-    surface.DrawLine(cx - pbW, cy, cx - pbW*0.6, cy)                -- Horizontal Left Arm
-    surface.DrawLine(cx + pbW*0.6, cy, cx + pbW, cy)                -- Horizontal Right Arm
-    surface.DrawLine(cx - pbW, cy, cx - pbW, cy + pbH)              -- Lower drops left
-    surface.DrawLine(cx + pbW, cy, cx + pbW, cy + pbH)              -- Lower drops right
+    surface.DrawLine(cx - pbW, cy, cx - pbW * 0.6, cy)
+    surface.DrawLine(cx + pbW * 0.6, cy, cx + pbW, cy)
+    surface.DrawLine(cx - pbW, cy, cx - pbW, cy + pbH)
+    surface.DrawLine(cx + pbW, cy, cx + pbW, cy + pbH)
 
-    -- Reticle Setup (Gap center cross)
+    -- Reticle
     local gH, lH = h * 0.02, h * 0.04
     surface.DrawLine(cx - gH - lH, cy, cx - gH, cy)
     surface.DrawLine(cx + gH, cy, cx + gH + lH, cy)
     surface.DrawLine(cx, cy - gH - lH, cx, cy - gH)
     surface.DrawLine(cx, cy + gH, cx, cy + gH + lH)
-    -- Micro cross dot exactly dead-center 
     surface.DrawLine(cx - 3, cy, cx + 3, cy)
     surface.DrawLine(cx, cy - 3, cx, cy + 3)
 
-    -- HEADING TAPE LOGIC
-    local tapeSpanDeg = math.Clamp(cam.fov * 1.5, 30, 90)           -- The compass slice spread adapts minimally with zoom 
+    -- Heading tape
+    local tapeSpanDeg = math.Clamp(cam.fov * 1.5, 30, 90)
     local pxScaleMap  = (fW * 0.7) / tapeSpanDeg
-    for degOffset = -45, 45 do 
-        local markSpanSize = 5 -- tape notches step size 
+    for degOffset = -45, 45 do
+        local markSpanSize = 5
         if degOffset % markSpanSize == 0 then
-            -- Finding proper interval headings surrounding our current yaw orientation map 
-            local notchAng  = math.floor(trueAzimuth / markSpanSize) * markSpanSize + degOffset
-            -- Smallest path arc representation difference calculation 
-            local diffLeft  = math.AngleDifference(notchAng, trueAzimuth) 
-            local tapeXPX   = cx + (diffLeft * pxScaleMap)
+            local notchAng = math.floor(trueAzimuth / markSpanSize) * markSpanSize + degOffset
+            local diffLeft = math.AngleDifference(notchAng, trueAzimuth)
+            local tapeXPX  = cx + (diffLeft * pxScaleMap)
 
-            -- Keep compass tape bounds clipped within center upper area logic 
-            if tapeXPX > bx and tapeXPX < bx + fW then 
-                local isMajor = notchAng % 15 == 0 
+            if tapeXPX > bx and tapeXPX < bx + fW then
+                local isMajor = notchAng % 15 == 0
                 surface.DrawLine(tapeXPX, by, tapeXPX, by + (isMajor and 8 or 4))
-                
+
                 if isMajor then
                     local labelAngle = (notchAng + 360) % 360
                     local bearingStr = string.format("%02d", labelAngle / 10)
@@ -456,44 +598,33 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
         end
     end
 
-    -- TELEMETRY READOUT PANELS 
-    
-    -- Center Data blocks (Right below azimuth bounding map / Central Bottom Statuses)
     HDTS_Text(string.format("AZ %03.0f°", trueAzimuth), cx, by + 12, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, col)
     HDTS_Text(string.format("EL %s%02.0f°", cam.pitch < 0 and "-" or "+", math.abs(cam.pitch)), cx + fW / 2 - bL, by - 4, TEXT_ALIGN_RIGHT, TEXT_ALIGN_BOTTOM, col)
-    
-    -- Flank Top-Left Setup  (Mode Status)
+
     HDTS_Text("MODE : HDTS FLIR", sLeft, sLeft)
     HDTS_Text("WPN  : SAFE", sLeft, sLeft + 15)
     HDTS_Text("LSR  : LRF RDY", sLeft, sLeft + 30)
 
-    -- Flank Bottom-Left Setup  (System Parameters / Optical Modes)
-    local factorZOOM = 1 + ((FOV_BASE - cam.fov) / (FOV_BASE - FOV_MIN) * 9) -- Simulates 1x-10x factor format zoom display string formatting mappings
+    local factorZOOM = 1 + ((FOV_BASE - cam.fov) / (FOV_BASE - FOV_MIN) * 9)
     HDTS_Text(isNarrowFov and "SIGHT: TADS/NAR" or "SIGHT: TADS/WID", sLeft, bHeight - 30)
     HDTS_Text(string.format("ZOOM : [%.1fx]", factorZOOM), sLeft, bHeight - 15)
 
-    -- Flank Top-Right Setup (Kinematic Aircraft Navigation Variables Simulation Scale Calculations Approximated Metric Outputs Math Values Setup Readings Map Variables Calculations Readouts)
     HDTS_Text(string.format("SPD : %04.0f KTS", spd_kts), sRight, sLeft, TEXT_ALIGN_RIGHT)
     HDTS_Text(string.format("ALT : %04.0f FT", alt_feet), sRight, sLeft + 15, TEXT_ALIGN_RIGHT)
     HDTS_Text(string.format("HDG : %03.0f° TRU", trueAzimuth), sRight, sLeft + 30, TEXT_ALIGN_RIGHT)
-    
-    -- Flank Bottom-Right Setup  (Synthetic Coordinates & Subsystems)
-    local rndLatValGridSimulatedMappingDataStringFormatterVarMath = math.abs(pos.y * 11) % 100000 
-    local rndLonValGridSimulatedMappingDataStringFormatterVarMath = math.abs(pos.x * 11) % 100000 
-    HDTS_Text(string.format("COORDN : %06.0f", rndLatValGridSimulatedMappingDataStringFormatterVarMath), sRight, bHeight - 30, TEXT_ALIGN_RIGHT)
-    HDTS_Text(string.format("COORDE : %06.0f", rndLonValGridSimulatedMappingDataStringFormatterVarMath), sRight, bHeight - 15, TEXT_ALIGN_RIGHT)
 
+    local rndLat = math.abs(pos.y * 11) % 100000
+    local rndLon = math.abs(pos.x * 11) % 100000
+    HDTS_Text(string.format("COORDN : %06.0f", rndLat), sRight, bHeight - 30, TEXT_ALIGN_RIGHT)
+    HDTS_Text(string.format("COORDE : %06.0f", rndLon), sRight, bHeight - 15, TEXT_ALIGN_RIGHT)
 
-    -- LOCK INDICATIONS: Process Only Targets Visible In-Frame To Count accurately.
+    -- On-screen signature count + per-target brackets
     local onScreenSignatures = {}
     for i = 1, #haloTargets do
         local tgt = haloTargets[i]
         if IsValid(tgt) then
-            -- Tweak aim pivot position for HUD screen coordinate projection accurately locating body center vs boots.
-            local tgtPos = tgt.WorldSpaceCenter and tgt:WorldSpaceCenter() or (tgt:GetPos() + Vector(0,0,35))
+            local tgtPos = tgt.WorldSpaceCenter and tgt:WorldSpaceCenter() or (tgt:GetPos() + Vector(0, 0, 35))
             local sc = tgtPos:ToScreen()
-            
-            -- Stringent bounds filter confirming it's genuinely projected strictly inside physical rendered POV 
             if sc.visible and sc.x >= 0 and sc.x <= w and sc.y >= 0 and sc.y <= h then
                 onScreenSignatures[#onScreenSignatures + 1] = { x = sc.x, y = sc.y }
             end
@@ -502,62 +633,40 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
 
     local trackAmountValue = #onScreenSignatures
     if trackAmountValue > 0 then
-        local signatureTextTargetMappingTrackingValuesStringsSysReadVarLogValue = trackAmountValue .. " TRK HEAT SGN "
-        
-        -- Flash on acquisition frames tracking
-        local fColorSwapValTrackModeSimulates = (math.sin(RealTime() * 10) > 0) and alertCol or col
-        HDTS_Text(signatureTextTargetMappingTrackingValuesStringsSysReadVarLogValue, cx, by + fH + 5, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, fColorSwapValTrackModeSimulates)
-        
-        -- Local interior bounding target acquire bounding indicator sub-lines mapped offset sizing mappings brackets setups
-        surface.SetDrawColor(alertCol)
-        local gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables = gH * 2
-        -- 4 small L corner sets tightly framing targeting core optical mapping tracking brackets sizing visual setups read
-        local sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables = 8
-        local tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx = cx - gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables
-        local tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy = cy - gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables
-        
-        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy)
-        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
-        
-        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy)
-        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
-        
-        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables)
-        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
-        
-        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables)
-        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
+        local signatureText = trackAmountValue .. " TRK HEAT SGN "
+        local fColor = (math.sin(RealTime() * 10) > 0) and alertCol or col
+        HDTS_Text(signatureText, cx, by + fH + 5, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, fColor)
 
-        -- =========================================================================
-        -- === MILITARY ENHANCEMENT: DYNAMIC ON-SCREEN TARGET TRACKING BRACKETS ====
-        -- Projects individual locking reticles strictly for screen-bound valid locks
-        -- =========================================================================
+        surface.SetDrawColor(alertCol)
+        local gap = gH * 2
+        local sSz = 8
+        local lx, ly = cx - gap, cy - gap
+        local rx, ry = cx + gap, cy + gap
+
+        surface.DrawLine(lx, ly, lx + sSz, ly)
+        surface.DrawLine(lx, ly, lx, ly + sSz)
+        surface.DrawLine(rx, ly, rx - sSz, ly)
+        surface.DrawLine(rx, ly, rx, ly + sSz)
+        surface.DrawLine(lx, ry, lx + sSz, ry)
+        surface.DrawLine(lx, ry, lx, ry - sSz)
+        surface.DrawLine(rx, ry, rx - sSz, ry)
+        surface.DrawLine(rx, ry, rx, ry - sSz)
+
         for i = 1, trackAmountValue do
             local scPos = onScreenSignatures[i]
             local sx, sy = scPos.x, scPos.y
-            local sz = 12 -- Box spread size
-            local sl = 4  -- Corner line length
-            
-            -- Top-Left Corner
+            local sz, sl = 12, 4
+
             surface.DrawLine(sx - sz, sy - sz, sx - sz + sl, sy - sz)
             surface.DrawLine(sx - sz, sy - sz, sx - sz, sy - sz + sl)
-            
-            -- Top-Right Corner
             surface.DrawLine(sx + sz, sy - sz, sx + sz - sl, sy - sz)
             surface.DrawLine(sx + sz, sy - sz, sx + sz, sy - sz + sl)
-            
-            -- Bottom-Left Corner
             surface.DrawLine(sx - sz, sy + sz, sx - sz + sl, sy + sz)
             surface.DrawLine(sx - sz, sy + sz, sx - sz, sy + sz - sl)
-            
-            -- Bottom-Right Corner
             surface.DrawLine(sx + sz, sy + sz, sx + sz - sl, sy + sz)
             surface.DrawLine(sx + sz, sy + sz, sx + sz, sy + sz - sl)
-            
-            -- Micro PIP (Picture in Picture) Center Tracking Dot
             surface.DrawRect(sx - 1, sy - 1, 2, 2)
         end
-
     else
         HDTS_Text("0 SGN TRK  [ STNDBY ]", cx, by + fH + 5, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, col)
     end
