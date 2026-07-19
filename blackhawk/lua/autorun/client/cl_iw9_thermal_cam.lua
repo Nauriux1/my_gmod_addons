@@ -34,7 +34,8 @@ local GIMBAL_LOCAL_OFFSET = Vector(100, -10, -50) -- belly-mounted; tune in-game
 local FOV_BASE, FOV_MIN = 50, 15
 local DETECT_RANGE = 4000
 
-local cam = {
+-- Named "tcam" (not "cam") so we never shadow the global cam.* render library.
+local tcam = {
     active    = false,
     vehicle   = NULL,
     seatIndex = nil,
@@ -89,8 +90,8 @@ local function RestoreGlideCameraHooks()
 end
 
 local function StopThermalCam()
-    if not cam.active then return end
-    cam.active = false
+    if not tcam.active then return end
+    tcam.active = false
     RestoreGlideCameraHooks()
 end
 
@@ -99,21 +100,21 @@ end
 -- ---------------------------------------------------------------------
 
 hook.Add("Glide_OnLocalEnterVehicle", "iw9_ThermalCam.Track", function(vehicle, seatIndex)
-    cam.vehicle = vehicle
-    cam.seatIndex = seatIndex
+    tcam.vehicle = vehicle
+    tcam.seatIndex = seatIndex
     StopThermalCam()
 end)
 
 hook.Add("Glide_OnLocalExitVehicle", "iw9_ThermalCam.Track", function()
-    cam.vehicle = NULL
-    cam.seatIndex = nil
+    tcam.vehicle = NULL
+    tcam.seatIndex = nil
     StopThermalCam()
 end)
 
 local function CanUseThermalCam()
-    return IsValid(cam.vehicle)
-        and SUPPORTED_CLASSES[cam.vehicle:GetClass()]
-        and cam.seatIndex == GIMBAL_SEAT
+    return IsValid(tcam.vehicle)
+        and SUPPORTED_CLASSES[tcam.vehicle:GetClass()]
+        and tcam.seatIndex == GIMBAL_SEAT
 end
 
 -- ---------------------------------------------------------------------
@@ -122,7 +123,7 @@ end
 
 hook.Add("Think", "iw9_ThermalCam.Toggle", function()
     if not CanUseThermalCam() then
-        if cam.active then StopThermalCam() end
+        if tcam.active then StopThermalCam() end
         return
     end
 
@@ -130,13 +131,13 @@ hook.Add("Think", "iw9_ThermalCam.Toggle", function()
     if not IsValid(ply) then return end
 
     if ply:KeyPressed(IN_ATTACK) then
-        cam.active = not cam.active
+        tcam.active = not tcam.active
 
-        if cam.active then
+        if tcam.active then
             -- Start looking straight down whichever way the vehicle's
             -- currently facing, rather than some arbitrary fixed angle.
-            local vehAng = cam.vehicle:GetAngles()
-            cam.yaw, cam.pitch, cam.fov = vehAng.y, 20, FOV_BASE
+            local vehAng = tcam.vehicle:GetAngles()
+            tcam.yaw, tcam.pitch, tcam.fov = vehAng.y, 20, FOV_BASE
             SuppressGlideCameraHooks()
             surface.PlaySound("buttons/button24.wav")
         else
@@ -154,11 +155,11 @@ end)
 -- ---------------------------------------------------------------------
 
 hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
-    if not cam.active or not CanUseThermalCam() then return end
+    if not tcam.active or not CanUseThermalCam() then return end
 
     local sens = 0.05
-    cam.yaw   = (cam.yaw - x * sens) % 360
-    cam.pitch = math.Clamp(cam.pitch + y * sens, -85, 85)
+    tcam.yaw   = (tcam.yaw - x * sens) % 360
+    tcam.pitch = math.Clamp(tcam.pitch + y * sens, -85, 85)
 
     return true
 end)
@@ -168,12 +169,12 @@ end)
 -- ---------------------------------------------------------------------
 
 hook.Add("Think", "iw9_ThermalCam.Zoom", function()
-    if not cam.active then return end
+    if not tcam.active then return end
     local ply = LocalPlayer()
     if not IsValid(ply) then return end
 
     local target = ply:KeyDown(IN_ZOOM) and FOV_MIN or FOV_BASE
-    cam.fov = Lerp(FrameTime() * 4, cam.fov, target)
+    tcam.fov = Lerp(FrameTime() * 4, tcam.fov, target)
 end)
 
 -- ---------------------------------------------------------------------
@@ -184,13 +185,13 @@ end)
 -- ---------------------------------------------------------------------
 
 hook.Add("PostPostHGCalcView", "iw9_ThermalCam.CalcView", function()
-    if not cam.active or not CanUseThermalCam() then return end
+    if not tcam.active or not CanUseThermalCam() then return end
 
-    local vehicle = cam.vehicle
+    local vehicle = tcam.vehicle
     return {
         origin      = vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET),
-        angles      = Angle(cam.pitch, cam.yaw, 0),
-        fov         = cam.fov,
+        angles      = Angle(tcam.pitch, tcam.yaw, 0),
+        fov         = tcam.fov,
         drawviewer  = true,
     }
 end)
@@ -200,7 +201,7 @@ end)
 -- Multi-pass post-process approximating military green-hot FLIR:
 --   1) high-contrast desaturate + green phosphor grade
 --   2) heat bloom on bright (warm) regions
---   3) CRT/FLIR scanlines
+--   3) green wash + CRT/FLIR scanlines
 --   4) sensor noise / grain
 --   5) soft radial vignette
 -- Pure Lua — no external .vmt / compiled pixel shader required.
@@ -217,15 +218,6 @@ local thermalColorModify = {
     ["$pp_colour_mulg"]       = 0.55,
     ["$pp_colour_mulb"]       = 0.12,
 }
-
--- Soft additive green wash material (built at runtime).
-local matGreenWash = CreateMaterial("iw9_thermal_greenwash", "UnlitGeneric", {
-    ["$basetexture"] = "vgui/white",
-    ["$vertexcolor"] = 1,
-    ["$vertexalpha"] = 1,
-    ["$translucent"] = 1,
-    ["$ignorez"]     = 1,
-})
 
 local matNoise = Material("effects/tvscreen_noise002a") -- engine stock; fails soft if missing
 local hasNoise = not matNoise:IsError()
@@ -280,7 +272,7 @@ local function DrawThermalVignette(w, h)
 end
 
 hook.Add("RenderScreenspaceEffects", "iw9_ThermalCam.Effect", function()
-    if not cam.active then return end
+    if not tcam.active then return end
 
     -- Pass 1: FLIR color grade (high contrast, near-mono, green phosphor).
     DrawColorModify(thermalColorModify)
@@ -288,19 +280,13 @@ hook.Add("RenderScreenspaceEffects", "iw9_ThermalCam.Effect", function()
     -- Pass 2: heat bloom — lifts bright/warm regions so bodies and engines glow.
     DrawBloom(0.55, 1.8, 8, 8, 1, 0.9, 0.35, 1.0, 0.35)
 
-    -- Pass 3: subtle green additive wash over the whole frame.
-    render.SetMaterial(matGreenWash)
-    surface.SetDrawColor(30, 180, 70, 22)
-    surface.DrawTexturedRect(0, 0, ScrW(), ScrH())
-end)
-
--- Overlay passes that need surface drawing (scanlines / grain / vignette).
--- Kept in RenderScreenspaceEffects after the engine PP so they composite correctly.
-hook.Add("RenderScreenspaceEffects", "iw9_ThermalCam.EffectOverlay", function()
-    if not cam.active then return end
-
+    -- Pass 3–5: overlays that need 2D surface drawing.
     local w, h = ScrW(), ScrH()
     cam.Start2D()
+        -- Soft green additive wash
+        surface.SetDrawColor(30, 180, 70, 22)
+        surface.DrawRect(0, 0, w, h)
+
         DrawThermalScanlines(w, h)
         DrawThermalGrain(w, h)
         DrawThermalVignette(w, h)
@@ -330,9 +316,9 @@ end
 
 hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
     table.Empty(haloTargets)
-    if not cam.active or not IsValid(cam.vehicle) then return end
+    if not tcam.active or not IsValid(tcam.vehicle) then return end
 
-    local origin = cam.vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET)
+    local origin = tcam.vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET)
     local me = LocalPlayer()
 
     for _, target in player.Iterator() do
@@ -351,7 +337,7 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
         local tr = util.TraceLine({
             start  = origin,
             endpos = eyePos,
-            filter = { cam.vehicle, character, target, me },
+            filter = { tcam.vehicle, character, target, me },
             mask   = MASK_SOLID_BRUSHONLY,
         })
         if tr.Fraction >= 0.98 then
@@ -370,7 +356,7 @@ end)
 -- ---------------------------------------------------------------------
 
 hook.Add("HUDShouldDraw", "iw9_ThermalCam.HideDefaultHUD", function(name)
-    if cam.active and name == "CHudCrosshair" then return false end
+    if tcam.active and name == "CHudCrosshair" then return false end
 end)
 
 -- Helper text layout map
@@ -379,7 +365,7 @@ local function HDTS_Text(text, x, y, alignX, alignY, color)
 end
 
 hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
-    if not cam.active then return end
+    if not tcam.active then return end
 
     local w, h   = ScrW(), ScrH()
     local cx, cy = w / 2, h / 2
@@ -387,7 +373,7 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     local alertCol = Color(255, 140, 80, 230)
 
     -- Telemetry logic gathering
-    local veh = cam.vehicle
+    local veh = tcam.vehicle
     local pos = IsValid(veh) and veh:GetPos() or Vector(0,0,0)
     local vel = IsValid(veh) and veh:GetVelocity() or Vector(0,0,0)
 
@@ -395,8 +381,8 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     local alt_feet = math.max(0, pos.z / 12)
     local spd_kts  = vel:Length() * 0.05
     -- Turning Garry's yaw map standard: convert (+left/-right) onto a descending 360-based Aircraft Compass Scale.
-    local trueAzimuth = ((-cam.yaw % 360) + 360) % 360
-    local isNarrowFov = cam.fov < FOV_BASE - 5
+    local trueAzimuth = ((-tcam.yaw % 360) + 360) % 360
+    local isNarrowFov = tcam.fov < FOV_BASE - 5
 
     -- Screen boundary offsets for side panel telemetry
     local sLeft   = h * 0.1
@@ -439,7 +425,7 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     surface.DrawLine(cx, cy - 3, cx, cy + 3)
 
     -- HEADING TAPE LOGIC
-    local tapeSpanDeg = math.Clamp(cam.fov * 1.5, 30, 90)
+    local tapeSpanDeg = math.Clamp(tcam.fov * 1.5, 30, 90)
     local pxScaleMap  = (fW * 0.7) / tapeSpanDeg
     for degOffset = -45, 45 do
         local markSpanSize = 5
@@ -469,7 +455,7 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     -- TELEMETRY READOUT PANELS
 
     HDTS_Text(string.format("AZ %03.0f°", trueAzimuth), cx, by + 12, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, col)
-    HDTS_Text(string.format("EL %s%02.0f°", cam.pitch < 0 and "-" or "+", math.abs(cam.pitch)), cx + fW / 2 - bL, by - 4, TEXT_ALIGN_RIGHT, TEXT_ALIGN_BOTTOM, col)
+    HDTS_Text(string.format("EL %s%02.0f°", tcam.pitch < 0 and "-" or "+", math.abs(tcam.pitch)), cx + fW / 2 - bL, by - 4, TEXT_ALIGN_RIGHT, TEXT_ALIGN_BOTTOM, col)
 
     -- Flank Top-Left Setup  (Mode Status)
     HDTS_Text("MODE : HDTS FLIR", sLeft, sLeft)
@@ -477,7 +463,7 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     HDTS_Text("LSR  : LRF RDY", sLeft, sLeft + 30)
 
     -- Flank Bottom-Left Setup  (System Parameters / Optical Modes)
-    local factorZOOM = 1 + ((FOV_BASE - cam.fov) / (FOV_BASE - FOV_MIN) * 9)
+    local factorZOOM = 1 + ((FOV_BASE - tcam.fov) / (FOV_BASE - FOV_MIN) * 9)
     HDTS_Text(isNarrowFov and "SIGHT: TADS/NAR" or "SIGHT: TADS/WID", sLeft, bHeight - 30)
     HDTS_Text(string.format("ZOOM : [%.1fx]", factorZOOM), sLeft, bHeight - 15)
 
