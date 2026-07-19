@@ -273,7 +273,15 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
     end
 
     if #haloTargets > 0 then
-        halo.Add(haloTargets, Color(255, 200, 80), 2, 2, 1, true, false)
+        -- === MILITARY FLIR "WHITE-HOT" HALO ===
+        -- Adds subtle pulse to simulate sensor scan/refresh
+        local pulse = 220 + math.sin(RealTime() * 15) * 35 
+        
+        -- 1. Outer Layer: Soft thermal bleeding/bloom
+        halo.Add(haloTargets, Color(200, 255, 200, pulse * 0.4), 4, 4, 1, true, false)
+        
+        -- 2. Inner Layer: Solid, intense "White-Hot" signature core
+        halo.Add(haloTargets, Color(pulse, pulse, pulse, 255), 1, 1, 3, true, false)
     end
 end)
 
@@ -410,8 +418,23 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     HDTS_Text(string.format("COORDE : %06.0f", rndLonValGridSimulatedMappingDataStringFormatterVarMath), sRight, bHeight - 15, TEXT_ALIGN_RIGHT)
 
 
-    -- Lock Indications
-    local trackAmountValue = #haloTargets
+    -- LOCK INDICATIONS: Process Only Targets Visible In-Frame To Count accurately.
+    local onScreenSignatures = {}
+    for i = 1, #haloTargets do
+        local tgt = haloTargets[i]
+        if IsValid(tgt) then
+            -- Tweak aim pivot position for HUD screen coordinate projection accurately locating body center vs boots.
+            local tgtPos = tgt.WorldSpaceCenter and tgt:WorldSpaceCenter() or (tgt:GetPos() + Vector(0,0,35))
+            local sc = tgtPos:ToScreen()
+            
+            -- Stringent bounds filter confirming it's genuinely projected strictly inside physical rendered POV 
+            if sc.visible and sc.x >= 0 and sc.x <= w and sc.y >= 0 and sc.y <= h then
+                onScreenSignatures[#onScreenSignatures + 1] = { x = sc.x, y = sc.y }
+            end
+        end
+    end
+
+    local trackAmountValue = #onScreenSignatures
     if trackAmountValue > 0 then
         local signatureTextTargetMappingTrackingValuesStringsSysReadVarLogValue = trackAmountValue .. " TRK HEAT SGN "
         
@@ -426,6 +449,7 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
         local sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables = 8
         local tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx = cx - gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables
         local tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy = cy - gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables
+        
         surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy)
         surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
         
@@ -437,6 +461,37 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
         
         surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables)
         surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
+
+        -- =========================================================================
+        -- === MILITARY ENHANCEMENT: DYNAMIC ON-SCREEN TARGET TRACKING BRACKETS ====
+        -- Projects individual locking reticles strictly for screen-bound valid locks
+        -- =========================================================================
+        for i = 1, trackAmountValue do
+            local scPos = onScreenSignatures[i]
+            local sx, sy = scPos.x, scPos.y
+            local sz = 12 -- Box spread size
+            local sl = 4  -- Corner line length
+            
+            -- Top-Left Corner
+            surface.DrawLine(sx - sz, sy - sz, sx - sz + sl, sy - sz)
+            surface.DrawLine(sx - sz, sy - sz, sx - sz, sy - sz + sl)
+            
+            -- Top-Right Corner
+            surface.DrawLine(sx + sz, sy - sz, sx + sz - sl, sy - sz)
+            surface.DrawLine(sx + sz, sy - sz, sx + sz, sy - sz + sl)
+            
+            -- Bottom-Left Corner
+            surface.DrawLine(sx - sz, sy + sz, sx - sz + sl, sy + sz)
+            surface.DrawLine(sx - sz, sy + sz, sx - sz, sy + sz - sl)
+            
+            -- Bottom-Right Corner
+            surface.DrawLine(sx + sz, sy + sz, sx + sz - sl, sy + sz)
+            surface.DrawLine(sx + sz, sy + sz, sx + sz, sy + sz - sl)
+            
+            -- Micro PIP (Picture in Picture) Center Tracking Dot
+            surface.DrawRect(sx - 1, sy - 1, 2, 2)
+        end
+
     else
         HDTS_Text("0 SGN TRK  [ STNDBY ]", cx, by + fH + 5, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, col)
     end
