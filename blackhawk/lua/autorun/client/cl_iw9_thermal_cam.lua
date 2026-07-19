@@ -11,6 +11,7 @@
 --   * Break lock by losing LOS, or RMB + LMB again
 --   * Zoom still works while locked
 --   * Plain LMB (no RMB / not zoomed) → exit thermal
+--   * R (reload) → laser rangefinder pulse; range shown on HUD
 --
 -- Deliberately NOT added to iw9_veh_blima_gship (the armed gunship
 -- variant): seat 2 there already fires the main turret on left click
@@ -32,7 +33,16 @@ local GIMBAL_LOCAL_OFFSET = Vector(100, -10, -50)
 local FOV_BASE, FOV_MIN = 50, 15
 local DETECT_RANGE = 4000
 local TOGGLE_COOLDOWN = 0.45
-local LOCK_AIM_DOT = 0.96 -- ~16° cone fallback when the aim trace misses the body
+local LOCK_AIM_DOT = 0.96
+
+-- Laser rangefinder
+local LRF_MAX_UNITS   = 12000 -- max slant range in Source units
+local LRF_COOLDOWN    = 1.25  -- recycle time between pulses (seconds)
+local LRF_HOLD_TIME   = 10    -- how long a good range stays on the HUD
+local LRF_FLASH_TIME  = 0.4   -- FIRE status flash duration
+-- Source: 1 unit ≈ 0.75 in → meters ≈ units * 0.01905
+local UNITS_TO_METERS = 0.01905
+local UNITS_TO_FEET   = 0.0625
 
 local CAM_HULL_RADIUS   = 6
 local CAM_COLLISION_MIN = Vector(-CAM_HULL_RADIUS, -CAM_HULL_RADIUS, -CAM_HULL_RADIUS)
@@ -93,13 +103,18 @@ local cam = {
 
     nextToggle = 0,
 
-    -- Target lock (player entity). NULL when free-look.
     lockTarget = NULL,
 
-    -- Explicit RMB tracking (PlayerBindPress + hardware mouse).
-    -- ply:KeyDown(IN_ATTACK2) alone is unreliable at the exact frame
-    -- +attack fires, which previously made lock attempts power-off thermal.
     rmbHeld    = false,
+
+    -- LRF state
+    lrfNext    = 0,     -- CurTime when next pulse is allowed
+    lrfTime    = 0,     -- CurTime of last pulse
+    lrfFlash   = 0,     -- CurTime until FIRE flash ends
+    lrfValid   = false, -- true if last pulse got a return
+    lrfUnits   = 0,     -- slant range in Source units
+    lrfMeters  = 0,
+    lrfFeet    = 0,
 }
 
 local haloTargets = {}
@@ -150,6 +165,15 @@ local function ClearLock(playSound)
     end
 end
 
+local function ClearLRF()
+    cam.lrfValid  = false
+    cam.lrfUnits  = 0
+    cam.lrfMeters = 0
+    cam.lrfFeet   = 0
+    cam.lrfTime   = 0
+    cam.lrfFlash  = 0
+end
+
 local function StopThermalCam()
     if not cam.active then return end
     cam.active = false
@@ -161,6 +185,7 @@ local function StopThermalCam()
     cam.bloom = 0
     cam.prevVehAng = nil
     ClearLock(false)
+    ClearLRF()
     RestoreGlideCameraHooks()
 end
 
@@ -193,12 +218,12 @@ local function StartThermalCam()
     cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
     cam.shakeP, cam.shakeY, cam.shakeR = 0, 0, 0
     ClearLock(false)
+    ClearLRF()
+    cam.lrfNext = 0
     SuppressGlideCameraHooks()
     surface.PlaySound("buttons/button24.wav")
 end
 
--- True when the operator is holding right-mouse / attack2.
--- Multiple sources because KeyDown alone misses the +attack frame often.
 local function IsRMBDown(ply)
     if cam.rmbHeld then return true end
     if input.IsMouseDown(MOUSE_RIGHT) then return true end
@@ -206,7 +231,6 @@ local function IsRMBDown(ply)
     return false
 end
 
--- Lock intent: RMB held OR optics already pulled in (FOV past wide).
 local function WantsLockNotExit(ply)
     if IsRMBDown(ply) then return true end
     if cam.fov < (FOV_BASE - 3) then return true end
@@ -397,6 +421,76 @@ local function ToggleLock()
     end
 end
 
+-- ---------------------------------------------------------------------
+-- Laser rangefinder pulse
+-- Traces along the sensor boresight (or at the hard-lock aimpoint).
+-- ---------------------------------------------------------------------
+
+local function PulseLRF()
+    if not cam.active or not CanUseThermalCam() then return false end
+
+    local now = CurTime()
+    if now < cam.lrfNext then
+        surface.PlaySound("buttons/button10.wav") -- still recycling
+        return true
+    end
+
+    local origin = GetSafeCameraOrigin(cam.vehicle)
+    local ang = Angle(cam.pitch, cam.yaw, 0)
+
+    -- Prefer locked target aimpoint so a hard-lock range is on the body.
+    if IsValid(cam.lockTarget) then
+        local character = GetPlayerCharacter(cam.lockTarget)
+        if IsValid(character) then
+            ang = (GetCharacterEyePos(character) - origin):Angle()
+        end
+    end
+
+    local me = LocalPlayer()
+    local tr = util.TraceLine({
+        start  = origin,
+        endpos = origin + ang:Forward() * LRF_MAX_UNITS,
+        filter = { cam.vehicle, me },
+        mask   = MASK_SHOT,
+    })
+
+    cam.lrfTime  = now
+    cam.lrfNext  = now + LRF_COOLDOWN
+    cam.lrfFlash = now + LRF_FLASH_TIME
+
+    if tr.Hit and not tr.HitSky then
+        local units = origin:Distance(tr.HitPos)
+        cam.lrfValid  = true
+        cam.lrfUnits  = units
+        cam.lrfMeters = units * UNITS_TO_METERS
+        cam.lrfFeet   = units * UNITS_TO_FEET
+        surface.PlaySound("buttons/blip1.wav")
+    else
+        cam.lrfValid  = false
+        cam.lrfUnits  = 0
+        cam.lrfMeters = 0
+        cam.lrfFeet   = 0
+        surface.PlaySound("buttons/button8.wav") -- no return
+    end
+
+    return true
+end
+
+local function LRFHoldActive()
+    return cam.lrfTime > 0 and (CurTime() - cam.lrfTime) < LRF_HOLD_TIME
+end
+
+local function GetLRFStatus()
+    local now = CurTime()
+    if now < cam.lrfFlash then
+        return cam.lrfValid and "LRF FIRE" or "LRF NO RTN"
+    end
+    if now < cam.lrfNext then
+        return "LRF HOLD"
+    end
+    return "LRF RDY"
+end
+
 hook.Add("Glide_OnLocalEnterVehicle", "iw9_ThermalCam.Track", function(vehicle, seatIndex)
     cam.vehicle = vehicle
     cam.seatIndex = seatIndex
@@ -413,20 +507,12 @@ hook.Add("Glide_OnLocalExitVehicle", "iw9_ThermalCam.Track", function()
     StopThermalCam()
 end)
 
--- Keep an explicit RMB flag; KeyDown alone is flaky on the +attack frame.
 hook.Add("PlayerBindPress", "iw9_ThermalCam.RMB", function(ply, bind, pressed)
     if ply ~= LocalPlayer() then return end
     if bind == "+attack2" then
         cam.rmbHeld = pressed and true or false
     end
 end)
-
--- ---------------------------------------------------------------------
--- +attack bind:
---   thermal OFF  → turn ON (unarmed only)
---   thermal ON + RMB/zoom → lock / unlock (NEVER power off)
---   thermal ON + no RMB   → turn OFF
--- ---------------------------------------------------------------------
 
 hook.Add("PlayerBindPress", "iw9_ThermalCam.Toggle", function(ply, bind, pressed)
     if not pressed then return end
@@ -442,15 +528,12 @@ hook.Add("PlayerBindPress", "iw9_ThermalCam.Toggle", function(ply, bind, pressed
     end
 
     if cam.active then
-        -- Lock path: RMB held OR already zoomed in. Must never fall through
-        -- to StopThermalCam — that was the bug.
         if WantsLockNotExit(ply) then
             ToggleLock()
             cam.nextToggle = now + TOGGLE_COOLDOWN
             return true
         end
 
-        -- Plain LMB at wide FOV: exit thermal.
         StopThermalCam()
         surface.PlaySound("buttons/button10.wav")
         cam.nextToggle = now + TOGGLE_COOLDOWN
@@ -464,17 +547,32 @@ hook.Add("PlayerBindPress", "iw9_ThermalCam.Toggle", function(ply, bind, pressed
     return true
 end)
 
+-- R / +reload → LRF pulse while thermal is up (swallow so hands don't fidget).
+hook.Add("PlayerBindPress", "iw9_ThermalCam.LRF", function(ply, bind, pressed)
+    if not pressed then return end
+    if ply ~= LocalPlayer() then return end
+    if bind ~= "+reload" then return end
+    if not cam.active or not CanUseThermalCam() then return end
+
+    PulseLRF()
+    return true
+end)
+
 hook.Add("Think", "iw9_ThermalCam.Safety", function()
     if cam.active and not CanUseThermalCam() then
         StopThermalCam()
     end
 
-    -- Keep rmbHeld honest even if -attack2 bind is missed.
     if cam.active and cam.rmbHeld and not input.IsMouseDown(MOUSE_RIGHT) then
         local ply = LocalPlayer()
         if not (IsValid(ply) and ply:KeyDown(IN_ATTACK2)) then
             cam.rmbHeld = false
         end
+    end
+
+    -- Age out stale range so the HUD returns to RDY cleanly.
+    if cam.active and cam.lrfTime > 0 and not LRFHoldActive() then
+        ClearLRF()
     end
 end)
 
@@ -634,7 +732,9 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     cam.shakeR = math.sin(t * 13.2) * amp * 0.20
 
     local heatLoad = math.Clamp(#haloTargets / 6, 0, 1)
-    
+    local smear = math.Clamp(slewMag / math.max(maxRate, 1), 0, 1) * 0.35
+    local targetBloom = math.Clamp(heatLoad * 0.75 + smear, 0, 1)
+    cam.bloom = Lerp(math.min(1, 4 * dt), cam.bloom, targetBloom)
 end)
 
 hook.Add("Think", "iw9_ThermalCam.Zoom", function()
@@ -769,6 +869,7 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     local col    = Color(80, 255, 140, 230)
     local alertCol = Color(255, 140, 80, 230)
     local lockCol  = Color(255, 200, 60, 240)
+    local lrfCol   = Color(120, 220, 255, 240)
 
     local veh = cam.vehicle
     local pos = IsValid(veh) and veh:GetPos() or Vector(0, 0, 0)
@@ -842,13 +943,32 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     end
 
     local hudCol = isLocked and lockCol or col
+    local lrfStatus = GetLRFStatus()
+    local lrfStatusCol = hudCol
+    if lrfStatus == "LRF FIRE" then
+        lrfStatusCol = lrfCol
+    elseif lrfStatus == "LRF NO RTN" then
+        lrfStatusCol = alertCol
+    elseif lrfStatus == "LRF HOLD" then
+        lrfStatusCol = Color(180, 180, 100, 230)
+    end
 
     HDTS_Text(string.format("AZ %03.0f°", trueAzimuth), cx, by + 12, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, hudCol)
     HDTS_Text(string.format("EL %s%02.0f°", cam.pitch < 0 and "-" or "+", math.abs(cam.pitch)), cx + fW / 2 - bL, by - 4, TEXT_ALIGN_RIGHT, TEXT_ALIGN_BOTTOM, hudCol)
 
     HDTS_Text("MODE : HDTS FLIR", sLeft, sLeft, nil, nil, hudCol)
     HDTS_Text(isLocked and "WPN  : TRACK" or "WPN  : SAFE", sLeft, sLeft + 15, nil, nil, isLocked and lockCol or col)
-    HDTS_Text("LSR  : LRF RDY", sLeft, sLeft + 30, nil, nil, hudCol)
+    HDTS_Text("LSR  : " .. lrfStatus, sLeft, sLeft + 30, nil, nil, lrfStatusCol)
+
+    -- Live range under status when a hold is active
+    if LRFHoldActive() then
+        if cam.lrfValid then
+            HDTS_Text(string.format("RNG  : %05.0f M", cam.lrfMeters), sLeft, sLeft + 45, nil, nil, lrfCol)
+            HDTS_Text(string.format("     : %05.0f FT", cam.lrfFeet), sLeft, sLeft + 60, nil, nil, lrfCol)
+        else
+            HDTS_Text("RNG  : ----- M", sLeft, sLeft + 45, nil, nil, alertCol)
+        end
+    end
 
     local factorZOOM = 1 + ((FOV_BASE - cam.fov) / (FOV_BASE - FOV_MIN) * 9)
     HDTS_Text(isNarrowFov and "SIGHT: TADS/NAR" or "SIGHT: TADS/WID", sLeft, bHeight - 30, nil, nil, hudCol)
@@ -862,6 +982,16 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     local rndLon = math.abs(pos.x * 11) % 100000
     HDTS_Text(string.format("COORDN : %06.0f", rndLat), sRight, bHeight - 30, TEXT_ALIGN_RIGHT, nil, hudCol)
     HDTS_Text(string.format("COORDE : %06.0f", rndLon), sRight, bHeight - 15, TEXT_ALIGN_RIGHT, nil, hudCol)
+
+    -- Large center range callout after a successful pulse
+    if LRFHoldActive() and cam.lrfValid then
+        local age = CurTime() - cam.lrfTime
+        local alpha = age < 1 and 255 or math.Clamp(255 * (1 - (age - 1) / (LRF_HOLD_TIME - 1)), 80, 255)
+        local bigCol = Color(lrfCol.r, lrfCol.g, lrfCol.b, alpha)
+        HDTS_Text(string.format("R %05.0f M", cam.lrfMeters), cx, cy + h * 0.12, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, bigCol)
+    elseif LRFHoldActive() and not cam.lrfValid and CurTime() < cam.lrfFlash then
+        HDTS_Text("NO RTN", cx, cy + h * 0.12, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, alertCol)
+    end
 
     if isLocked then
         local flash = (math.sin(RealTime() * 8) > 0) and lockCol or alertCol
