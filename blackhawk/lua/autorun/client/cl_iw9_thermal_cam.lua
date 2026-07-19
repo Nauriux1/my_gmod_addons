@@ -45,9 +45,53 @@ local cam = {
 
 local haloTargets = {}
 
+-- Stored originals of Glide's hooks so we can restore them exactly when
+-- thermal cam turns off. We deliberately do NOT try to out-prioritize
+-- Glide's HOOK_HIGH entries (that approach was unreliable against the
+-- zcity/Glide composition). Instead we remove Glide's hooks for the
+-- duration of thermal mode and put the exact same functions back afterwards.
+local originalGlideCalcView = nil
+local originalGlideMouse    = nil
+local glideHooksSuppressed  = false
+
+local function SuppressGlideCameraHooks()
+    if glideHooksSuppressed then return end
+
+    local calcTable = hook.GetTable()["PostPostHGCalcView"]
+    if calcTable and calcTable["GlideCamera.CalcView"] then
+        originalGlideCalcView = calcTable["GlideCamera.CalcView"]
+        hook.Remove("PostPostHGCalcView", "GlideCamera.CalcView")
+    end
+
+    local mouseTable = hook.GetTable()["InputMouseApply"]
+    if mouseTable and mouseTable["GlideCamera.InputMouseApply"] then
+        originalGlideMouse = mouseTable["GlideCamera.InputMouseApply"]
+        hook.Remove("InputMouseApply", "GlideCamera.InputMouseApply")
+    end
+
+    glideHooksSuppressed = true
+end
+
+local function RestoreGlideCameraHooks()
+    if not glideHooksSuppressed then return end
+
+    if originalGlideCalcView then
+        hook.Add("PostPostHGCalcView", "GlideCamera.CalcView", originalGlideCalcView, HOOK_HIGH)
+        originalGlideCalcView = nil
+    end
+
+    if originalGlideMouse then
+        hook.Add("InputMouseApply", "GlideCamera.InputMouseApply", originalGlideMouse, HOOK_HIGH)
+        originalGlideMouse = nil
+    end
+
+    glideHooksSuppressed = false
+end
+
 local function StopThermalCam()
     if not cam.active then return end
     cam.active = false
+    RestoreGlideCameraHooks()
 end
 
 -- ---------------------------------------------------------------------
@@ -93,8 +137,10 @@ hook.Add("Think", "iw9_ThermalCam.Toggle", function()
             -- currently facing, rather than some arbitrary fixed angle.
             local vehAng = cam.vehicle:GetAngles()
             cam.yaw, cam.pitch, cam.fov = vehAng.y, 20, FOV_BASE
+            SuppressGlideCameraHooks()
             surface.PlaySound("buttons/button24.wav")
         else
+            RestoreGlideCameraHooks()
             surface.PlaySound("buttons/button10.wav")
         end
     end
@@ -102,10 +148,9 @@ end)
 
 -- ---------------------------------------------------------------------
 -- Mouse look: fully free 360, independent of the vehicle's orientation.
--- Registered at HOOK_MONITOR_HIGH specifically to run (and consume the
--- input, per InputMouseApply's "return true to suppress" contract)
--- before Glide's own camera hook, which sits at HOOK_HIGH -- otherwise
--- Glide's vehicle-look would fight this for the same mouse input.
+-- Glide's own InputMouseApply is removed while we are active, so we no
+-- longer need to fight priority; a plain return true is enough to keep
+-- other mouse consumers from seeing the deltas.
 -- ---------------------------------------------------------------------
 
 hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
@@ -116,7 +161,7 @@ hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
     cam.pitch = math.Clamp(cam.pitch + y * sens, -85, 85)
 
     return true
-end, HOOK_MONITOR_HIGH)
+end)
 
 -- ---------------------------------------------------------------------
 -- Zoom: hold the normal zoom bind to close in
@@ -133,6 +178,9 @@ end)
 
 -- ---------------------------------------------------------------------
 -- The actual camera override
+-- Glide's PostPostHGCalcView is removed while we are active, so this
+-- hook can run at normal priority and will be the one that supplies the
+-- view table.
 -- ---------------------------------------------------------------------
 
 hook.Add("PostPostHGCalcView", "iw9_ThermalCam.CalcView", function()
@@ -145,7 +193,7 @@ hook.Add("PostPostHGCalcView", "iw9_ThermalCam.CalcView", function()
         fov         = cam.fov,
         drawviewer  = true,
     }
-end, HOOK_MONITOR_HIGH)
+end)
 
 -- ---------------------------------------------------------------------
 -- Thermal look: desaturated + green-tinted screenspace effect, plus a
