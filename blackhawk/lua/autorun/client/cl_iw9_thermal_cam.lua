@@ -30,7 +30,7 @@ hg.vehiclecamblacklist["iw9_veh_blima"] = true
 local SUPPORTED_CLASSES = { iw9_veh_blima = true }
 local GIMBAL_SEAT = 2 -- co-pilot
 
-local GIMBAL_LOCAL_OFFSET = Vector(0, 0, -70) -- belly-mounted; tune in-game, exact hull size unverified
+local GIMBAL_LOCAL_OFFSET = Vector(100, -10, -50) -- belly-mounted; tune in-game, exact hull size unverified
 local FOV_BASE, FOV_MIN = 50, 15
 local DETECT_RANGE = 4000
 
@@ -245,34 +245,166 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
 end)
 
 -- ---------------------------------------------------------------------
--- HUD: simple camera-feed framing so it reads as a distinct mode, and
--- hide the normal crosshair so it doesn't clash with it.
+-- HDTS HUD Layout
+-- Full Head-Down Targeting System readout for military-style telemetry.
 -- ---------------------------------------------------------------------
 
 hook.Add("HUDShouldDraw", "iw9_ThermalCam.HideDefaultHUD", function(name)
     if cam.active and name == "CHudCrosshair" then return false end
 end)
 
+-- Helper text layout map
+local function HDTS_Text(text, x, y, alignX, alignY, color)
+    draw.SimpleText(text, "DermaDefaultBold", x, y, color, alignX or TEXT_ALIGN_LEFT, alignY or TEXT_ALIGN_TOP)
+end
+
 hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     if not cam.active then return end
 
-    local w, h = ScrW(), ScrH()
-    local edge = 40
-    local col  = Color(80, 255, 140, 200)
+    local w, h   = ScrW(), ScrH()
+    local cx, cy = w / 2, h / 2
+    local col    = Color(80, 255, 140, 230)
+    local alertCol = Color(255, 140, 80, 230)
 
+    -- Telemetry logic gathering
+    local veh = cam.vehicle
+    local pos = IsValid(veh) and veh:GetPos() or Vector(0,0,0)
+    local vel = IsValid(veh) and veh:GetVelocity() or Vector(0,0,0)
+
+    -- Rough flight conversions -> Height to Ft, speed approx to Knots
+    local alt_feet = math.max(0, pos.z / 12) 
+    local spd_kts  = vel:Length() * 0.05 
+    -- Turning Garry's yaw map standard: convert (+left/-right) onto a descending 360-based Aircraft Compass Scale.
+    local trueAzimuth = ((-cam.yaw % 360) + 360) % 360
+    local isNarrowFov = cam.fov < FOV_BASE - 5
+
+    -- Screen boundary offsets for side panel telemetry
+    local sLeft   = h * 0.1
+    local sRight  = w - (h * 0.1)
+    local bHeight = h - (h * 0.1)
+
+    -- Safe/Target framing central brackets
+    local fW, fH = w * 0.65, h * 0.65
+    local bx, by = cx - fW / 2, cy - fH / 2
+    local bL     = h * 0.05
+    
     surface.SetDrawColor(col)
-    surface.DrawLine(edge, edge, edge + 20, edge)
-    surface.DrawLine(edge, edge, edge, edge + 20)
-    surface.DrawLine(w - edge, edge, w - edge - 20, edge)
-    surface.DrawLine(w - edge, edge, w - edge, edge + 20)
-    surface.DrawLine(edge, h - edge, edge + 20, h - edge)
-    surface.DrawLine(edge, h - edge, edge, h - edge - 20)
-    surface.DrawLine(w - edge, h - edge, w - edge - 20, h - edge)
-    surface.DrawLine(w - edge, h - edge, w - edge, h - edge - 20)
 
-    draw.SimpleText("THERMAL CAM", "DermaDefaultBold", edge, edge - 18, col)
-    draw.SimpleText(
-        #haloTargets .. " HEAT SIGNATURE" .. (#haloTargets == 1 and "" or "S"),
-        "DermaDefaultBold", edge, h - edge + 4, col
-    )
+    -- Outer bounding field frames
+    surface.DrawLine(bx, by, bx + bL, by)                           -- Top Left L-Bracket
+    surface.DrawLine(bx, by, bx, by + bL)
+    surface.DrawLine(bx + fW, by, bx + fW - bL, by)                 -- Top Right L-Bracket
+    surface.DrawLine(bx + fW, by, bx + fW, by + bL)
+    surface.DrawLine(bx, by + fH, bx + bL, by + fH)                 -- Bottom Left L-Bracket
+    surface.DrawLine(bx, by + fH, bx, by + fH - bL)
+    surface.DrawLine(bx + fW, by + fH, bx + fW - bL, by + fH)       -- Bottom Right L-Bracket
+    surface.DrawLine(bx + fW, by + fH, bx + fW, by + fH - bL)
+
+    -- Sight Inner Pitch Horizon Brackets (Static framing structure simulating M-TADS lock borders)
+    local pbW = w * 0.15
+    local pbH = h * 0.06
+    surface.DrawLine(cx - pbW, cy, cx - pbW*0.6, cy)                -- Horizontal Left Arm
+    surface.DrawLine(cx + pbW*0.6, cy, cx + pbW, cy)                -- Horizontal Right Arm
+    surface.DrawLine(cx - pbW, cy, cx - pbW, cy + pbH)              -- Lower drops left
+    surface.DrawLine(cx + pbW, cy, cx + pbW, cy + pbH)              -- Lower drops right
+
+    -- Reticle Setup (Gap center cross)
+    local gH, lH = h * 0.02, h * 0.04
+    surface.DrawLine(cx - gH - lH, cy, cx - gH, cy)
+    surface.DrawLine(cx + gH, cy, cx + gH + lH, cy)
+    surface.DrawLine(cx, cy - gH - lH, cx, cy - gH)
+    surface.DrawLine(cx, cy + gH, cx, cy + gH + lH)
+    -- Micro cross dot exactly dead-center 
+    surface.DrawLine(cx - 3, cy, cx + 3, cy)
+    surface.DrawLine(cx, cy - 3, cx, cy + 3)
+
+    -- HEADING TAPE LOGIC
+    local tapeSpanDeg = math.Clamp(cam.fov * 1.5, 30, 90)           -- The compass slice spread adapts minimally with zoom 
+    local pxScaleMap  = (fW * 0.7) / tapeSpanDeg
+    for degOffset = -45, 45 do 
+        local markSpanSize = 5 -- tape notches step size 
+        if degOffset % markSpanSize == 0 then
+            -- Finding proper interval headings surrounding our current yaw orientation map 
+            local notchAng  = math.floor(trueAzimuth / markSpanSize) * markSpanSize + degOffset
+            -- Smallest path arc representation difference calculation 
+            local diffLeft  = math.AngleDifference(notchAng, trueAzimuth) 
+            local tapeXPX   = cx + (diffLeft * pxScaleMap)
+
+            -- Keep compass tape bounds clipped within center upper area logic 
+            if tapeXPX > bx and tapeXPX < bx + fW then 
+                local isMajor = notchAng % 15 == 0 
+                surface.DrawLine(tapeXPX, by, tapeXPX, by + (isMajor and 8 or 4))
+                
+                if isMajor then
+                    local labelAngle = (notchAng + 360) % 360
+                    local bearingStr = string.format("%02d", labelAngle / 10)
+                    if labelAngle == 0   then bearingStr = "N"
+                    elseif labelAngle == 90  then bearingStr = "E"
+                    elseif labelAngle == 180 then bearingStr = "S"
+                    elseif labelAngle == 270 then bearingStr = "W"
+                    end
+                    HDTS_Text(bearingStr, tapeXPX, by - 2, TEXT_ALIGN_CENTER, TEXT_ALIGN_BOTTOM, col)
+                end
+            end
+        end
+    end
+
+    -- TELEMETRY READOUT PANELS 
+    
+    -- Center Data blocks (Right below azimuth bounding map / Central Bottom Statuses)
+    HDTS_Text(string.format("AZ %03.0f°", trueAzimuth), cx, by + 12, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, col)
+    HDTS_Text(string.format("EL %s%02.0f°", cam.pitch < 0 and "-" or "+", math.abs(cam.pitch)), cx + fW / 2 - bL, by - 4, TEXT_ALIGN_RIGHT, TEXT_ALIGN_BOTTOM, col)
+    
+    -- Flank Top-Left Setup  (Mode Status)
+    HDTS_Text("MODE : HDTS FLIR", sLeft, sLeft)
+    HDTS_Text("WPN  : SAFE", sLeft, sLeft + 15)
+    HDTS_Text("LSR  : LRF RDY", sLeft, sLeft + 30)
+
+    -- Flank Bottom-Left Setup  (System Parameters / Optical Modes)
+    local factorZOOM = 1 + ((FOV_BASE - cam.fov) / (FOV_BASE - FOV_MIN) * 9) -- Simulates 1x-10x factor format zoom display string formatting mappings
+    HDTS_Text(isNarrowFov and "SIGHT: TADS/NAR" or "SIGHT: TADS/WID", sLeft, bHeight - 30)
+    HDTS_Text(string.format("ZOOM : [%.1fx]", factorZOOM), sLeft, bHeight - 15)
+
+    -- Flank Top-Right Setup (Kinematic Aircraft Navigation Variables Simulation Scale Calculations Approximated Metric Outputs Math Values Setup Readings Map Variables Calculations Readouts)
+    HDTS_Text(string.format("SPD : %04.0f KTS", spd_kts), sRight, sLeft, TEXT_ALIGN_RIGHT)
+    HDTS_Text(string.format("ALT : %04.0f FT", alt_feet), sRight, sLeft + 15, TEXT_ALIGN_RIGHT)
+    HDTS_Text(string.format("HDG : %03.0f° TRU", trueAzimuth), sRight, sLeft + 30, TEXT_ALIGN_RIGHT)
+    
+    -- Flank Bottom-Right Setup  (Synthetic Coordinates & Subsystems)
+    local rndLatValGridSimulatedMappingDataStringFormatterVarMath = math.abs(pos.y * 11) % 100000 
+    local rndLonValGridSimulatedMappingDataStringFormatterVarMath = math.abs(pos.x * 11) % 100000 
+    HDTS_Text(string.format("COORDN : %06.0f", rndLatValGridSimulatedMappingDataStringFormatterVarMath), sRight, bHeight - 30, TEXT_ALIGN_RIGHT)
+    HDTS_Text(string.format("COORDE : %06.0f", rndLonValGridSimulatedMappingDataStringFormatterVarMath), sRight, bHeight - 15, TEXT_ALIGN_RIGHT)
+
+
+    -- Lock Indications
+    local trackAmountValue = #haloTargets
+    if trackAmountValue > 0 then
+        local signatureTextTargetMappingTrackingValuesStringsSysReadVarLogValue = trackAmountValue .. " TRK HEAT SGN "
+        
+        -- Flash on acquisition frames tracking
+        local fColorSwapValTrackModeSimulates = (math.sin(RealTime() * 10) > 0) and alertCol or col
+        HDTS_Text(signatureTextTargetMappingTrackingValuesStringsSysReadVarLogValue, cx, by + fH + 5, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, fColorSwapValTrackModeSimulates)
+        
+        -- Local interior bounding target acquire bounding indicator sub-lines mapped offset sizing mappings brackets setups
+        surface.SetDrawColor(alertCol)
+        local gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables = gH * 2
+        -- 4 small L corner sets tightly framing targeting core optical mapping tracking brackets sizing visual setups read
+        local sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables = 8
+        local tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx = cx - gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables
+        local tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy = cy - gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables
+        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy)
+        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
+        
+        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy)
+        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlyMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSy+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
+        
+        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx+sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables)
+        surface.DrawLine(tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, tLlxMapTrackingPosVTrackerMapSetupOffsetsSizeLayoutVarsMappingTrackerMapValuesLockLMapTrackersV1XSysAestheticsBox1XMapYOffsetLayoutsV1SizeOffYOffsetsVarsBox1LockSizeMVSYSx, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
+        
+        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables)
+        surface.DrawLine(cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cx + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables, cy + gapXValueTargetsVisualIndicatorMappingOffsetsSizeLockSimDrawBracketVariablesLayoutOffsetsSysVariables-sSzLengthLockBoxAestheticTargetsBoxReticleSubVisualMappingTrackerBoxValuesOffsetsSysSubMapAestheticVariables)
+    else
+        HDTS_Text("0 SGN TRK  [ STNDBY ]", cx, by + fH + 5, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, col)
+    end
 end)
