@@ -34,6 +34,11 @@ local GIMBAL_LOCAL_OFFSET = Vector(100, -10, -50) -- belly-mounted; tune in-game
 local FOV_BASE, FOV_MIN = 50, 15
 local DETECT_RANGE = 4000
 
+-- Camera bounding settings to avoid Near-Z visual clipping against ground/walls. 
+local CAM_HULL_RADIUS   = 6
+local CAM_COLLISION_MIN = Vector(-CAM_HULL_RADIUS, -CAM_HULL_RADIUS, -CAM_HULL_RADIUS)
+local CAM_COLLISION_MAX = Vector(CAM_HULL_RADIUS, CAM_HULL_RADIUS, CAM_HULL_RADIUS)
+
 local cam = {
     active    = false,
     vehicle   = NULL,
@@ -41,6 +46,7 @@ local cam = {
     yaw       = 0,
     pitch     = 0,
     fov       = FOV_BASE,
+    lastZoom  = false,
 }
 
 local haloTargets = {}
@@ -95,6 +101,43 @@ local function StopThermalCam()
 end
 
 -- ---------------------------------------------------------------------
+-- Physical Camera Collision Resolution Helper Functions. 
+-- Ensures the view stays entirely clear without peeking beyond map bounds. 
+-- ---------------------------------------------------------------------
+local function GetSafeCameraOrigin(vehicle)
+    if not IsValid(vehicle) then return Vector() end
+
+    -- Avoid shooting bounding-traces diagonally out from origin through body chunks; 
+    -- instead we spawn safely *inside* above the pod vertically then strictly trace straight downwards to rest it firmly above surfaces/hillsides if clipping 
+    local startWorld = vehicle:LocalToWorld(Vector(GIMBAL_LOCAL_OFFSET.x, GIMBAL_LOCAL_OFFSET.y, 30))
+    local idealPos   = vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET)
+
+    local tr = util.TraceHull({
+        start  = startWorld,
+        endpos = idealPos,
+        mins   = CAM_COLLISION_MIN,
+        maxs   = CAM_COLLISION_MAX,
+        mask   = MASK_SOLID, -- Will impact Terrain, Physics brushes, & Items
+        filter = function(ent)
+            if not IsValid(ent) then return true end
+            if ent:IsPlayer() or ent:IsNPC() then return false end
+            
+            -- Prevent bounding collisions on any actual aircraft sub-props, extensions or armament nodes hooked to helicopter entity internally hierarchy trees paths structure trees paths mapping data map mappings layout.
+            local current = ent
+            while IsValid(current) do
+                if current == vehicle then return false end
+                current = current:GetParent()
+            end
+            
+            return true
+        end
+    })
+
+    return tr.HitPos
+end
+
+
+-- ---------------------------------------------------------------------
 -- Track current seat via the same events Glide's own camera uses
 -- ---------------------------------------------------------------------
 
@@ -117,7 +160,7 @@ local function CanUseThermalCam()
 end
 
 -- ---------------------------------------------------------------------
--- Toggle: left click while seated as co-pilot
+-- Toggle: left click while seated as co-pilot AND unarmed
 -- ---------------------------------------------------------------------
 
 hook.Add("Think", "iw9_ThermalCam.Toggle", function()
@@ -130,6 +173,13 @@ hook.Add("Think", "iw9_ThermalCam.Toggle", function()
     if not IsValid(ply) then return end
 
     if ply:KeyPressed(IN_ATTACK) then
+        -- WEAPON FILTER: Disallow thermal control panel toggle if holding a functional weapon.
+        local activeWep = ply:GetActiveWeapon()
+        local isUnarmed = not IsValid(activeWep) or activeWep:GetClass() == "weapon_hands_sh"
+        
+        -- Ignore Left Click system control sequence entirely if using anything other than bare hands / hands_sh weapon state
+        if not isUnarmed then return end
+
         cam.active = not cam.active
 
         if cam.active then
@@ -137,6 +187,7 @@ hook.Add("Think", "iw9_ThermalCam.Toggle", function()
             -- currently facing, rather than some arbitrary fixed angle.
             local vehAng = cam.vehicle:GetAngles()
             cam.yaw, cam.pitch, cam.fov = vehAng.y, 20, FOV_BASE
+            cam.lastZoom = false
             SuppressGlideCameraHooks()
             surface.PlaySound("buttons/button24.wav")
         else
@@ -148,15 +199,16 @@ end)
 
 -- ---------------------------------------------------------------------
 -- Mouse look: fully free 360, independent of the vehicle's orientation.
--- Glide's own InputMouseApply is removed while we are active, so we no
--- longer need to fight priority; a plain return true is enough to keep
--- other mouse consumers from seeing the deltas.
+-- Scale sensitivity dynamically inversely to FOV magnitude (Telephoto mode smooth pan tracking interpolation).
 -- ---------------------------------------------------------------------
 
 hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
     if not cam.active or not CanUseThermalCam() then return end
 
-    local sens = 0.05
+    -- Automatically map your pan controls exactly backwards over FOV zooming amounts making lock tracing flawlessly smooth and precise from the distance limits 
+    local currentFovMultiplier = cam.fov / FOV_BASE 
+    local sens = 0.05 * currentFovMultiplier
+    
     cam.yaw   = (cam.yaw - x * sens) % 360
     cam.pitch = math.Clamp(cam.pitch + y * sens, -85, 85)
 
@@ -164,7 +216,7 @@ hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
 end)
 
 -- ---------------------------------------------------------------------
--- Zoom: hold the normal zoom bind to close in
+-- Realistic Camera Lens Optical Swapping on Right Click holds + Optics click track noise feedback mechanisms. 
 -- ---------------------------------------------------------------------
 
 hook.Add("Think", "iw9_ThermalCam.Zoom", function()
@@ -172,8 +224,17 @@ hook.Add("Think", "iw9_ThermalCam.Zoom", function()
     local ply = LocalPlayer()
     if not IsValid(ply) then return end
 
-    local target = ply:KeyDown(IN_ZOOM) and FOV_MIN or FOV_BASE
-    cam.fov = Lerp(FrameTime() * 4, cam.fov, target)
+    -- Hold Right click mapped for the Telephoto Narrow-Sight tracking engagement 
+    local requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues = ply:KeyDown(IN_ATTACK2)
+    
+    if requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues ~= cam.lastZoom then 
+        surface.PlaySound("thermal/zoomin.ogg") -- Provides hardware simulation sounds matching camera internals re-seating physical optics.
+        cam.lastZoom = requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues
+    end 
+    
+    local fovMagnificationSetSystemOpticLimitsFOVSizeVarsMappingMapValSizeTGTSystemReadOffsetSys = requestZoomOpticsEngagedHoldMapReadToggleStateSystemVariableValues and FOV_MIN or FOV_BASE
+    -- Applies realistic fast servos exponentially dragging on max optic boundaries creating actual smoothness tracking curves compared vs pure linearity models limits rendering framing frames updates calculations 
+    cam.fov = Lerp(math.min(FrameTime() * 8, 1), cam.fov, fovMagnificationSetSystemOpticLimitsFOVSizeVarsMappingMapValSizeTGTSystemReadOffsetSys)
 end)
 
 -- ---------------------------------------------------------------------
@@ -187,8 +248,12 @@ hook.Add("PostPostHGCalcView", "iw9_ThermalCam.CalcView", function()
     if not cam.active or not CanUseThermalCam() then return end
 
     local vehicle = cam.vehicle
+    
+    -- Safe Trace Projection for final Render POV Calculation Rendering Coordinates Offset Position 
+    local viewPointRestSafeCalcRenderingPositionBoundsOutputSysMathVectorResult = GetSafeCameraOrigin(vehicle)
+    
     return {
-        origin      = vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET),
+        origin      = viewPointRestSafeCalcRenderingPositionBoundsOutputSysMathVectorResult,
         angles      = Angle(cam.pitch, cam.yaw, 0),
         fov         = cam.fov,
         drawviewer  = true,
@@ -245,7 +310,8 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
     table.Empty(haloTargets)
     if not cam.active or not IsValid(cam.vehicle) then return end
 
-    local origin = cam.vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET)
+    -- Safe Trace Point Reference Origin matching the current Rendering Position Math Camera System Data Coordinate Mapping Output Math Trace HitPos 
+    local origin = GetSafeCameraOrigin(cam.vehicle)
     local me = LocalPlayer()
 
     for _, target in player.Iterator() do
