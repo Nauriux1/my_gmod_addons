@@ -197,8 +197,10 @@ end)
 
 -- ---------------------------------------------------------------------
 -- Thermal look: desaturated + green-tinted screenspace effect, plus a
--- warm halo on any player the camera has a clear line of sight to. This
--- is "detection", not a wallhack -- if a wall's in the way, no halo.
+-- warm halo on any living player (standing or ragdolled) the camera has
+-- a clear line of sight to. Dead players and the local thermal operator
+-- are never marked. This is "detection", not a wallhack -- if a wall's
+-- in the way, no halo.
 -- ---------------------------------------------------------------------
 
 local thermalColorModify = {
@@ -218,24 +220,55 @@ hook.Add("RenderScreenspaceEffects", "iw9_ThermalCam.Effect", function()
     DrawColorModify(thermalColorModify)
 end)
 
+local function GetCharacterEyePos(character)
+    if character:IsPlayer() then
+        return character:EyePos()
+    end
+
+    -- prop_ragdoll (FakeRagdoll): prefer eyes attachment, then head bone, else a raised center.
+    local attId = character:LookupAttachment("eyes")
+    if attId and attId > 0 then
+        local att = character:GetAttachment(attId)
+        if att and att.Pos then return att.Pos end
+    end
+
+    local headBone = character:LookupBone("ValveBiped.Bip01_Head1")
+    if headBone then
+        local pos = character:GetBonePosition(headBone)
+        if pos then return pos end
+    end
+
+    return character:GetPos() + Vector(0, 0, 20)
+end
+
 hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
     table.Empty(haloTargets)
     if not cam.active or not IsValid(cam.vehicle) then return end
 
     local origin = cam.vehicle:LocalToWorld(GIMBAL_LOCAL_OFFSET)
+    local me = LocalPlayer()
 
     for _, target in player.Iterator() do
+        -- Never mark the thermal operator or fully dead players.
+        if target == me then continue end
         if not target:Alive() then continue end
-        if target:GetPos():DistToSqr(origin) > DETECT_RANGE * DETECT_RANGE then continue end
+
+        -- Living but ragdolled players are represented by their FakeRagdoll;
+        -- standing players are the player entity itself.
+        local character = IsValid(target.FakeRagdoll) and target.FakeRagdoll or target
+
+        if character:GetPos():DistToSqr(origin) > DETECT_RANGE * DETECT_RANGE then continue end
+
+        local eyePos = GetCharacterEyePos(character)
 
         local tr = util.TraceLine({
             start  = origin,
-            endpos = target:EyePos(),
-            filter = { cam.vehicle, target, LocalPlayer() },
+            endpos = eyePos,
+            filter = { cam.vehicle, character, target, me },
             mask   = MASK_SOLID_BRUSHONLY,
         })
         if tr.Fraction >= 0.98 then
-            haloTargets[#haloTargets + 1] = target
+            haloTargets[#haloTargets + 1] = character
         end
     end
 
