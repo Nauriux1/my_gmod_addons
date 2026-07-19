@@ -10,6 +10,7 @@
 --   * Hold RMB (zoom) + LMB on a player under the reticle → lock track
 --   * Break lock by losing LOS, or RMB + LMB again
 --   * Zoom still works while locked
+--   * Plain LMB (no RMB / not zoomed) → exit thermal
 --
 -- Deliberately NOT added to iw9_veh_blima_gship (the armed gunship
 -- variant): seat 2 there already fires the main turret on left click
@@ -94,6 +95,11 @@ local cam = {
 
     -- Target lock (player entity). NULL when free-look.
     lockTarget = NULL,
+
+    -- Explicit RMB tracking (PlayerBindPress + hardware mouse).
+    -- ply:KeyDown(IN_ATTACK2) alone is unreliable at the exact frame
+    -- +attack fires, which previously made lock attempts power-off thermal.
+    rmbHeld    = false,
 }
 
 local haloTargets = {}
@@ -137,12 +143,9 @@ local function RestoreGlideCameraHooks()
 end
 
 local function ClearLock(playSound)
-    if not IsValid(cam.lockTarget) and cam.lockTarget == NULL then
-        cam.lockTarget = NULL
-        return
-    end
+    local had = IsValid(cam.lockTarget)
     cam.lockTarget = NULL
-    if playSound then
+    if playSound and had then
         surface.PlaySound("buttons/button10.wav")
     end
 end
@@ -192,6 +195,22 @@ local function StartThermalCam()
     ClearLock(false)
     SuppressGlideCameraHooks()
     surface.PlaySound("buttons/button24.wav")
+end
+
+-- True when the operator is holding right-mouse / attack2.
+-- Multiple sources because KeyDown alone misses the +attack frame often.
+local function IsRMBDown(ply)
+    if cam.rmbHeld then return true end
+    if input.IsMouseDown(MOUSE_RIGHT) then return true end
+    if IsValid(ply) and ply:KeyDown(IN_ATTACK2) then return true end
+    return false
+end
+
+-- Lock intent: RMB held OR optics already pulled in (FOV past wide).
+local function WantsLockNotExit(ply)
+    if IsRMBDown(ply) then return true end
+    if cam.fov < (FOV_BASE - 3) then return true end
+    return false
 end
 
 local function GetSafeCameraOrigin(vehicle)
@@ -315,7 +334,6 @@ local function HasLOSToPlayer(ply)
     return tr.Fraction >= 0.98
 end
 
--- Player under the reticle (aim trace), with a cone fallback among LOS targets.
 local function FindAimPlayer()
     if not IsValid(cam.vehicle) then return nil end
 
@@ -336,7 +354,6 @@ local function FindAimPlayer()
         return hitPly
     end
 
-    -- Cone fallback: closest-to-center living player with LOS.
     local best, bestDot = nil, LOCK_AIM_DOT
     for _, ply in player.Iterator() do
         if ply == me or not ply:Alive() then continue end
@@ -360,17 +377,31 @@ end
 
 local function SetLock(ply)
     cam.lockTarget = ply
-    -- Kill residual rates so the gimbal commits cleanly to the track.
     cam.rateYaw, cam.ratePitch = 0, 0
     cam.precYaw, cam.precPitch = 0, 0
     cam.joltYaw, cam.joltPitch = 0, 0
     surface.PlaySound("buttons/button17.wav")
 end
 
+local function ToggleLock()
+    if IsValid(cam.lockTarget) then
+        ClearLock(true)
+        return
+    end
+
+    local tgt = FindAimPlayer()
+    if tgt then
+        SetLock(tgt)
+    else
+        surface.PlaySound("buttons/button8.wav")
+    end
+end
+
 hook.Add("Glide_OnLocalEnterVehicle", "iw9_ThermalCam.Track", function(vehicle, seatIndex)
     cam.vehicle = vehicle
     cam.seatIndex = seatIndex
     cam.nextToggle = 0
+    cam.rmbHeld = false
     StopThermalCam()
 end)
 
@@ -378,13 +409,22 @@ hook.Add("Glide_OnLocalExitVehicle", "iw9_ThermalCam.Track", function()
     cam.vehicle = NULL
     cam.seatIndex = nil
     cam.nextToggle = 0
+    cam.rmbHeld = false
     StopThermalCam()
+end)
+
+-- Keep an explicit RMB flag; KeyDown alone is flaky on the +attack frame.
+hook.Add("PlayerBindPress", "iw9_ThermalCam.RMB", function(ply, bind, pressed)
+    if ply ~= LocalPlayer() then return end
+    if bind == "+attack2" then
+        cam.rmbHeld = pressed and true or false
+    end
 end)
 
 -- ---------------------------------------------------------------------
 -- +attack bind:
 --   thermal OFF  → turn ON (unarmed only)
---   thermal ON + RMB held → lock / unlock target under reticle
+--   thermal ON + RMB/zoom → lock / unlock (NEVER power off)
 --   thermal ON + no RMB   → turn OFF
 -- ---------------------------------------------------------------------
 
@@ -402,23 +442,15 @@ hook.Add("PlayerBindPress", "iw9_ThermalCam.Toggle", function(ply, bind, pressed
     end
 
     if cam.active then
-        -- RMB held: target lock toggle (does NOT exit thermal).
-        if ply:KeyDown(IN_ATTACK2) then
-            if IsValid(cam.lockTarget) then
-                ClearLock(true)
-            else
-                local tgt = FindAimPlayer()
-                if tgt then
-                    SetLock(tgt)
-                else
-                    surface.PlaySound("buttons/button8.wav") -- no target
-                end
-            end
+        -- Lock path: RMB held OR already zoomed in. Must never fall through
+        -- to StopThermalCam — that was the bug.
+        if WantsLockNotExit(ply) then
+            ToggleLock()
             cam.nextToggle = now + TOGGLE_COOLDOWN
             return true
         end
 
-        -- Plain LMB: exit thermal.
+        -- Plain LMB at wide FOV: exit thermal.
         StopThermalCam()
         surface.PlaySound("buttons/button10.wav")
         cam.nextToggle = now + TOGGLE_COOLDOWN
@@ -436,13 +468,15 @@ hook.Add("Think", "iw9_ThermalCam.Safety", function()
     if cam.active and not CanUseThermalCam() then
         StopThermalCam()
     end
-end)
 
--- ---------------------------------------------------------------------
--- Target lock maintainer: steer command pose at the locked player,
--- break if they die or LOS is lost. Runs before gimbal dynamics so the
--- motors chase the updated command the same frame.
--- ---------------------------------------------------------------------
+    -- Keep rmbHeld honest even if -attack2 bind is missed.
+    if cam.active and cam.rmbHeld and not input.IsMouseDown(MOUSE_RIGHT) then
+        local ply = LocalPlayer()
+        if not (IsValid(ply) and ply:KeyDown(IN_ATTACK2)) then
+            cam.rmbHeld = false
+        end
+    end
+end)
 
 hook.Add("Think", "iw9_ThermalCam.LockTrack", function()
     if not cam.active or not CanUseThermalCam() then return end
@@ -467,15 +501,9 @@ hook.Add("Think", "iw9_ThermalCam.LockTrack", function()
     cam.cmdPitch = math.Clamp(ang.p, -85, 85)
 end)
 
--- ---------------------------------------------------------------------
--- Mouse → command pose (disabled while locked — autotrack owns aim).
--- ---------------------------------------------------------------------
-
 hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
     if not cam.active or not CanUseThermalCam() then return end
 
-    -- Still swallow mouse so the vehicle camera doesn't steal it,
-    -- but ignore deltas while locked onto a target.
     if IsValid(cam.lockTarget) then
         return true
     end
@@ -488,10 +516,6 @@ hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
     return true
 end)
 
--- ---------------------------------------------------------------------
--- Critically-damped gimbal + gyro precession + residual jolts
--- ---------------------------------------------------------------------
-
 hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     if not cam.active or not CanUseThermalCam() then return end
 
@@ -503,8 +527,6 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     local maxRate = GetMaxSlewRate()
     local isLocked = IsValid(cam.lockTarget)
 
-    -- While locked, allow a slightly higher slew so the tracker can keep up
-    -- with a sprinting target even at narrow FOV.
     if isLocked then
         maxRate = math.max(maxRate, 45)
     end
@@ -540,7 +562,6 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
 
     local slewMag = math.abs(cam.rateYaw) + math.abs(cam.ratePitch)
 
-    -- Skip precession / jolt command nudges while locked — tracker owns aim.
     if not isLocked then
         local drivePrecPitch =  cam.rateYaw   * PRECESS_GAIN
         local drivePrecYaw   = -cam.ratePitch * PRECESS_GAIN
@@ -594,7 +615,6 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
             cam.cmdPitch = math.Clamp(cam.cmdPitch + step, -85, 85)
         end
     else
-        -- Still track airframe angles so free-look resumes cleanly after unlock.
         local vehAng = vehicle:GetAngles()
         cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
         cam.precYaw, cam.precPitch = 0, 0
@@ -619,13 +639,12 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     cam.bloom = Lerp(math.min(1, 4 * dt), cam.bloom, targetBloom)
 end)
 
--- Zoom: hold RMB. Works whether locked or free-looking.
 hook.Add("Think", "iw9_ThermalCam.Zoom", function()
     if not cam.active then return end
     local ply = LocalPlayer()
     if not IsValid(ply) then return end
 
-    local wantZoom = ply:KeyDown(IN_ATTACK2)
+    local wantZoom = IsRMBDown(ply)
 
     if wantZoom ~= cam.lastZoom then
         surface.PlaySound("thermal/zoomin.ogg")
@@ -727,7 +746,6 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
         halo.Add(haloTargets, Color(230, 255, 230, 180 + b * 60), 2 + b * 2, 2 + b * 2, 2, true, false)
         halo.Add(haloTargets, Color(pulse, pulse, pulse, 255), 1, 1, 3, true, false)
 
-        -- Emphasize the locked target with a distinct orange halo.
         if IsValid(cam.lockTarget) then
             local lockChar = GetPlayerCharacter(cam.lockTarget)
             if IsValid(lockChar) then
@@ -851,7 +869,6 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
         local flash = (math.sin(RealTime() * 8) > 0) and lockCol or alertCol
         HDTS_Text("★ HARD LOCK", cx, by + fH + 5, TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP, flash)
 
-        -- Larger locked-on brackets at center
         surface.SetDrawColor(lockCol)
         local gap, sSz = gH * 2.4, 12
         local lx, ly = cx - gap, cy - gap
