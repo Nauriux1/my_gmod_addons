@@ -1,24 +1,17 @@
 -- Co-pilot (seat 2) thermal gimbal camera for the Vulture (iw9_veh_blima).
 --
--- Left click while seated as co-pilot toggles a fixed camera slung under
--- the helicopter's belly: free 360-degree look independent of the
--- airframe's orientation (like a real stabilized gimbal), a green
--- thermal-style screenspace filter, and a warm halo on any player the
--- camera has a clear line of sight to.
+-- Left click while seated as co-pilot deploys a belly FLIR gimbal, then
+-- enables free look, thermal grade, heat detection, hard-lock track, and LRF.
+-- Stowing (LMB while deployed, not zoom-locking) runs the reverse sequence.
 --
--- While thermal is active:
---   * Hold RMB (zoom) + LMB on a player under the reticle → lock track
---   * Break lock by losing LOS, or RMB + LMB again
+-- While deployed:
+--   * Hold RMB + LMB on a player → hard lock / unlock
 --   * Zoom still works while locked
---   * Plain LMB (no RMB / not zoomed) → exit thermal
---   * R (reload) → laser rangefinder pulse; range shown on HUD
+--   * R → LRF pulse
+--   * HUD shows target angular rate, estimated speed, and lead offsets
 --
--- Deliberately NOT added to iw9_veh_blima_gship (the armed gunship
--- variant): seat 2 there already fires the main turret on left click
--- (see iw9_veh_blima_gship.lua's ENT:Think -> self.turret:UpdateUser).
---
--- This entire feature is client-only, purely visual/read-only (no
--- gameplay state to sync), so there's no server-side file at all.
+-- Deliberately NOT added to iw9_veh_blima_gship.
+-- Client-only, purely visual/read-only.
 
 if not CLIENT then return end
 if not Glide then return end
@@ -27,7 +20,7 @@ hg.vehiclecamblacklist = hg.vehiclecamblacklist or {}
 hg.vehiclecamblacklist["iw9_veh_blima"] = true
 
 local SUPPORTED_CLASSES = { iw9_veh_blima = true }
-local GIMBAL_SEAT = 2 -- co-pilot
+local GIMBAL_SEAT = 2
 
 local GIMBAL_LOCAL_OFFSET = Vector(100, -10, -50)
 local FOV_BASE, FOV_MIN = 50, 15
@@ -35,14 +28,19 @@ local DETECT_RANGE = 4000
 local TOGGLE_COOLDOWN = 0.45
 local LOCK_AIM_DOT = 0.96
 
--- Laser rangefinder
-local LRF_MAX_UNITS   = 12000 -- max slant range in Source units
-local LRF_COOLDOWN    = 1.25  -- recycle time between pulses (seconds)
-local LRF_HOLD_TIME   = 10    -- how long a good range stays on the HUD
-local LRF_FLASH_TIME  = 0.4   -- FIRE status flash duration
--- Source: 1 unit ≈ 0.75 in → meters ≈ units * 0.01905
+local LRF_MAX_UNITS   = 12000
+local LRF_COOLDOWN    = 1.25
+local LRF_HOLD_TIME   = 10
+local LRF_FLASH_TIME  = 0.4
 local UNITS_TO_METERS = 0.01905
 local UNITS_TO_FEET   = 0.0625
+
+-- Stow / deploy timing
+local DEPLOY_TIME = 1.7
+local STOW_TIME   = 1.3
+
+-- Lead display: how many seconds of pure angular lead to draw on the pip
+local LEAD_TIME = 0.4
 
 local CAM_HULL_RADIUS   = 6
 local CAM_COLLISION_MIN = Vector(-CAM_HULL_RADIUS, -CAM_HULL_RADIUS, -CAM_HULL_RADIUS)
@@ -69,52 +67,62 @@ local VIB_ZOOM_POWER   = 1.3
 local ROLL_FROM_YAW    = 0.03
 local ROLL_RETURN      = 8
 
+-- deployState: "stowed" | "deploying" | "deployed" | "stowing"
 local cam = {
-    active     = false,
-    vehicle    = NULL,
-    seatIndex  = nil,
+    active      = false,
+    vehicle     = NULL,
+    seatIndex   = nil,
 
-    cmdYaw     = 0,
-    cmdPitch   = 20,
+    deployState = "stowed",
+    deployFrac  = 0,
 
-    yaw        = 0,
-    pitch      = 20,
-    roll       = 0,
+    cmdYaw      = 0,
+    cmdPitch    = 20,
 
-    rateYaw    = 0,
-    ratePitch  = 0,
+    yaw         = 0,
+    pitch       = 20,
+    roll        = 0,
 
-    precYaw    = 0,
-    precPitch  = 0,
+    rateYaw     = 0,
+    ratePitch   = 0,
 
-    joltYaw    = 0,
-    joltPitch  = 0,
+    precYaw     = 0,
+    precPitch   = 0,
 
-    fov        = FOV_BASE,
-    lastZoom   = false,
+    joltYaw     = 0,
+    joltPitch   = 0,
 
-    prevVehAng = nil,
+    fov         = FOV_BASE,
+    lastZoom    = false,
 
-    shakeP     = 0,
-    shakeY     = 0,
-    shakeR     = 0,
+    prevVehAng  = nil,
 
-    bloom      = 0,
+    shakeP      = 0,
+    shakeY      = 0,
+    shakeR      = 0,
 
-    nextToggle = 0,
+    nextToggle  = 0,
 
-    lockTarget = NULL,
+    lockTarget  = NULL,
 
-    rmbHeld    = false,
+    rmbHeld     = false,
 
-    -- LRF state
-    lrfNext    = 0,     -- CurTime when next pulse is allowed
-    lrfTime    = 0,     -- CurTime of last pulse
-    lrfFlash   = 0,     -- CurTime until FIRE flash ends
-    lrfValid   = false, -- true if last pulse got a return
-    lrfUnits   = 0,     -- slant range in Source units
-    lrfMeters  = 0,
-    lrfFeet    = 0,
+    lrfNext     = 0,
+    lrfTime     = 0,
+    lrfFlash    = 0,
+    lrfValid    = false,
+    lrfUnits    = 0,
+    lrfMeters   = 0,
+    lrfFeet     = 0,
+
+    -- Target kinematics (deg/s, kts, lead deg)
+    tgtRateAz   = 0,
+    tgtRateEl   = 0,
+    tgtSpeedKts = 0,
+    leadAz      = 0,
+    leadEl      = 0,
+    prevTgtAng  = nil,
+    prevTgtPos  = nil,
 }
 
 local haloTargets = {}
@@ -160,6 +168,11 @@ end
 local function ClearLock(playSound)
     local had = IsValid(cam.lockTarget)
     cam.lockTarget = NULL
+    cam.tgtRateAz, cam.tgtRateEl = 0, 0
+    cam.tgtSpeedKts = 0
+    cam.leadAz, cam.leadEl = 0, 0
+    cam.prevTgtAng = nil
+    cam.prevTgtPos = nil
     if playSound and had then
         surface.PlaySound("buttons/button10.wav")
     end
@@ -174,19 +187,34 @@ local function ClearLRF()
     cam.lrfFlash  = 0
 end
 
-local function StopThermalCam()
-    if not cam.active then return end
+local function IsDeployed()
+    return cam.deployState == "deployed"
+end
+
+local function IsSensorLive()
+    -- Full FLIR / lock / LRF only when fully out.
+    return cam.active and cam.deployState == "deployed"
+end
+
+local function FinishStow()
     cam.active = false
+    cam.deployState = "stowed"
+    cam.deployFrac = 0
     cam.rateYaw, cam.ratePitch = 0, 0
     cam.precYaw, cam.precPitch = 0, 0
     cam.joltYaw, cam.joltPitch = 0, 0
     cam.roll = 0
     cam.shakeP, cam.shakeY, cam.shakeR = 0, 0, 0
-    cam.bloom = 0
     cam.prevVehAng = nil
     ClearLock(false)
     ClearLRF()
     RestoreGlideCameraHooks()
+end
+
+local function StopThermalCam()
+    -- Immediate hard stop (seat exit / invalid). Skips stow animation.
+    if not cam.active and cam.deployState == "stowed" then return end
+    FinishStow()
 end
 
 local function CanUseThermalCam()
@@ -195,33 +223,42 @@ local function CanUseThermalCam()
         and cam.seatIndex == GIMBAL_SEAT
 end
 
-local function StartThermalCam()
-    if cam.active then return end
+local function BeginDeploy()
+    if cam.deployState ~= "stowed" then return end
     if not CanUseThermalCam() then return end
 
     local vehAng = cam.vehicle:GetAngles()
-    cam.active    = true
-    cam.cmdYaw    = vehAng.y
-    cam.cmdPitch  = 20
-    cam.yaw       = vehAng.y
-    cam.pitch     = 20
-    cam.roll      = 0
-    cam.rateYaw   = 0
-    cam.ratePitch = 0
-    cam.precYaw   = 0
-    cam.precPitch = 0
-    cam.joltYaw   = 0
-    cam.joltPitch = 0
-    cam.fov       = FOV_BASE
-    cam.lastZoom  = false
-    cam.bloom     = 0
-    cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
+    cam.active      = true
+    cam.deployState = "deploying"
+    cam.deployFrac  = 0
+    cam.cmdYaw      = vehAng.y
+    cam.cmdPitch    = 20
+    cam.yaw         = vehAng.y
+    cam.pitch       = 20
+    cam.roll        = 0
+    cam.rateYaw     = 0
+    cam.ratePitch   = 0
+    cam.precYaw     = 0
+    cam.precPitch   = 0
+    cam.joltYaw     = 0
+    cam.joltPitch   = 0
+    cam.fov         = FOV_BASE
+    cam.lastZoom    = false
+    cam.prevVehAng  = Angle(vehAng.p, vehAng.y, vehAng.r)
     cam.shakeP, cam.shakeY, cam.shakeR = 0, 0, 0
     ClearLock(false)
     ClearLRF()
     cam.lrfNext = 0
     SuppressGlideCameraHooks()
-    surface.PlaySound("buttons/button24.wav")
+    surface.PlaySound("buttons/lever7.wav")
+end
+
+local function BeginStow()
+    if cam.deployState ~= "deployed" and cam.deployState ~= "deploying" then return end
+    ClearLock(false)
+    ClearLRF()
+    cam.deployState = "stowing"
+    surface.PlaySound("buttons/lever8.wav")
 end
 
 local function IsRMBDown(ply)
@@ -404,10 +441,16 @@ local function SetLock(ply)
     cam.rateYaw, cam.ratePitch = 0, 0
     cam.precYaw, cam.precPitch = 0, 0
     cam.joltYaw, cam.joltPitch = 0, 0
+    cam.prevTgtAng = nil
+    cam.prevTgtPos = nil
+    cam.tgtRateAz, cam.tgtRateEl = 0, 0
+    cam.leadAz, cam.leadEl = 0, 0
     surface.PlaySound("buttons/button17.wav")
 end
 
 local function ToggleLock()
+    if not IsSensorLive() then return end
+
     if IsValid(cam.lockTarget) then
         ClearLock(true)
         return
@@ -421,24 +464,18 @@ local function ToggleLock()
     end
 end
 
--- ---------------------------------------------------------------------
--- Laser rangefinder pulse
--- Traces along the sensor boresight (or at the hard-lock aimpoint).
--- ---------------------------------------------------------------------
-
 local function PulseLRF()
-    if not cam.active or not CanUseThermalCam() then return false end
+    if not IsSensorLive() then return false end
 
     local now = CurTime()
     if now < cam.lrfNext then
-        surface.PlaySound("buttons/button10.wav") -- still recycling
+        surface.PlaySound("buttons/button10.wav")
         return true
     end
 
     local origin = GetSafeCameraOrigin(cam.vehicle)
     local ang = Angle(cam.pitch, cam.yaw, 0)
 
-    -- Prefer locked target aimpoint so a hard-lock range is on the body.
     if IsValid(cam.lockTarget) then
         local character = GetPlayerCharacter(cam.lockTarget)
         if IsValid(character) then
@@ -470,7 +507,7 @@ local function PulseLRF()
         cam.lrfUnits  = 0
         cam.lrfMeters = 0
         cam.lrfFeet   = 0
-        surface.PlaySound("buttons/button8.wav") -- no return
+        surface.PlaySound("buttons/button8.wav")
     end
 
     return true
@@ -527,35 +564,65 @@ hook.Add("PlayerBindPress", "iw9_ThermalCam.Toggle", function(ply, bind, pressed
         return
     end
 
-    if cam.active then
+    -- Busy deploying/stowing: swallow click, don't reverse mid-cycle.
+    if cam.deployState == "deploying" or cam.deployState == "stowing" then
+        return true
+    end
+
+    if cam.deployState == "deployed" then
         if WantsLockNotExit(ply) then
             ToggleLock()
             cam.nextToggle = now + TOGGLE_COOLDOWN
             return true
         end
 
-        StopThermalCam()
-        surface.PlaySound("buttons/button10.wav")
+        BeginStow()
         cam.nextToggle = now + TOGGLE_COOLDOWN
         return true
     end
 
+    -- Stowed → deploy
     if not IsUnarmed(ply) then return end
 
-    StartThermalCam()
+    BeginDeploy()
     cam.nextToggle = now + TOGGLE_COOLDOWN
     return true
 end)
 
--- R / +reload → LRF pulse while thermal is up (swallow so hands don't fidget).
 hook.Add("PlayerBindPress", "iw9_ThermalCam.LRF", function(ply, bind, pressed)
     if not pressed then return end
     if ply ~= LocalPlayer() then return end
     if bind ~= "+reload" then return end
-    if not cam.active or not CanUseThermalCam() then return end
+    if not IsSensorLive() then return end
 
     PulseLRF()
     return true
+end)
+
+-- ---------------------------------------------------------------------
+-- Deploy / stow animation driver
+-- ---------------------------------------------------------------------
+
+hook.Add("Think", "iw9_ThermalCam.Deploy", function()
+    if not cam.active then return end
+
+    local dt = FrameTime()
+    if dt <= 0 then return end
+
+    if cam.deployState == "deploying" then
+        cam.deployFrac = math.min(1, cam.deployFrac + dt / DEPLOY_TIME)
+        if cam.deployFrac >= 1 then
+            cam.deployState = "deployed"
+            cam.deployFrac = 1
+            surface.PlaySound("buttons/button24.wav")
+        end
+    elseif cam.deployState == "stowing" then
+        cam.deployFrac = math.max(0, cam.deployFrac - dt / STOW_TIME)
+        if cam.deployFrac <= 0 then
+            FinishStow()
+            surface.PlaySound("buttons/button10.wav")
+        end
+    end
 end)
 
 hook.Add("Think", "iw9_ThermalCam.Safety", function()
@@ -570,16 +637,24 @@ hook.Add("Think", "iw9_ThermalCam.Safety", function()
         end
     end
 
-    -- Age out stale range so the HUD returns to RDY cleanly.
-    if cam.active and cam.lrfTime > 0 and not LRFHoldActive() then
+    if IsSensorLive() and cam.lrfTime > 0 and not LRFHoldActive() then
         ClearLRF()
     end
 end)
 
+-- ---------------------------------------------------------------------
+-- Lock track + target rate / lead computation
+-- ---------------------------------------------------------------------
+
 hook.Add("Think", "iw9_ThermalCam.LockTrack", function()
-    if not cam.active or not CanUseThermalCam() then return end
+    if not IsSensorLive() then return end
     if not IsValid(cam.lockTarget) then
         cam.lockTarget = NULL
+        cam.tgtRateAz, cam.tgtRateEl = 0, 0
+        cam.tgtSpeedKts = 0
+        cam.leadAz, cam.leadEl = 0, 0
+        cam.prevTgtAng = nil
+        cam.prevTgtPos = nil
         return
     end
 
@@ -590,6 +665,10 @@ hook.Add("Think", "iw9_ThermalCam.LockTrack", function()
         return
     end
 
+    local dt = FrameTime()
+    if dt <= 0 then return end
+    dt = math.min(dt, 0.05)
+
     local character = GetPlayerCharacter(ply)
     local origin = GetSafeCameraOrigin(cam.vehicle)
     local aimPos = GetCharacterEyePos(character)
@@ -597,10 +676,39 @@ hook.Add("Think", "iw9_ThermalCam.LockTrack", function()
 
     cam.cmdYaw   = ang.y
     cam.cmdPitch = math.Clamp(ang.p, -85, 85)
+
+    -- Angular rate of the line-of-sight vector (deg/s).
+    if cam.prevTgtAng then
+        local rawAz = AngleDiffDeg(ang.y, cam.prevTgtAng.y) / dt
+        local rawEl = (ang.p - cam.prevTgtAng.p) / dt
+        -- Light smoothing so the HUD doesn't chatter.
+        cam.tgtRateAz = Lerp(math.min(1, 10 * dt), cam.tgtRateAz, rawAz)
+        cam.tgtRateEl = Lerp(math.min(1, 10 * dt), cam.tgtRateEl, rawEl)
+    end
+    cam.prevTgtAng = Angle(ang.p, ang.y, 0)
+
+    -- Estimated target ground speed (same kts scale as aircraft HUD).
+    local vel = ply:GetVelocity()
+    if IsValid(character) and not character:IsPlayer() then
+        -- Ragdoll: approximate from position delta if velocity is dead.
+        if cam.prevTgtPos then
+            local d = (aimPos - cam.prevTgtPos):Length() / dt
+            cam.tgtSpeedKts = Lerp(math.min(1, 6 * dt), cam.tgtSpeedKts, d * 0.05)
+        end
+    else
+        cam.tgtSpeedKts = Lerp(math.min(1, 6 * dt), cam.tgtSpeedKts, vel:Length() * 0.05)
+    end
+    cam.prevTgtPos = aimPos
+
+    -- Pure angular lead pip (seconds of motion ahead of current LOS).
+    cam.leadAz = cam.tgtRateAz * LEAD_TIME
+    cam.leadEl = cam.tgtRateEl * LEAD_TIME
 end)
 
 hook.Add("InputMouseApply", "iw9_ThermalCam.Mouse", function(cmd, x, y, ang)
     if not cam.active or not CanUseThermalCam() then return end
+    -- No free-look until fully deployed; swallow so vehicle cam stays suppressed.
+    if not IsDeployed() then return true end
 
     if IsValid(cam.lockTarget) then
         return true
@@ -616,6 +724,7 @@ end)
 
 hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     if not cam.active or not CanUseThermalCam() then return end
+    if cam.deployState == "stowed" then return end
 
     local dt = FrameTime()
     if dt <= 0 then return end
@@ -623,10 +732,17 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
 
     local vehicle = cam.vehicle
     local maxRate = GetMaxSlewRate()
-    local isLocked = IsValid(cam.lockTarget)
+    local isLocked = IsValid(cam.lockTarget) and IsDeployed()
 
     if isLocked then
         maxRate = math.max(maxRate, 45)
+    end
+
+    -- During deploy/stow, hold a fixed nose-down search pose.
+    if not IsDeployed() then
+        local vehAng = vehicle:GetAngles()
+        cam.cmdYaw   = vehAng.y
+        cam.cmdPitch = 25
     end
 
     local errYaw   = AngleDiffDeg(cam.cmdYaw, cam.yaw)
@@ -660,7 +776,7 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
 
     local slewMag = math.abs(cam.rateYaw) + math.abs(cam.ratePitch)
 
-    if not isLocked then
+    if IsDeployed() and not isLocked then
         local drivePrecPitch =  cam.rateYaw   * PRECESS_GAIN
         local drivePrecYaw   = -cam.ratePitch * PRECESS_GAIN
 
@@ -715,8 +831,10 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     else
         local vehAng = vehicle:GetAngles()
         cam.prevVehAng = Angle(vehAng.p, vehAng.y, vehAng.r)
-        cam.precYaw, cam.precPitch = 0, 0
-        cam.joltYaw, cam.joltPitch = 0, 0
+        if isLocked or not IsDeployed() then
+            cam.precYaw, cam.precPitch = 0, 0
+            cam.joltYaw, cam.joltPitch = 0, 0
+        end
     end
 
     local targetRoll = -cam.rateYaw * ROLL_FROM_YAW
@@ -726,19 +844,16 @@ hook.Add("Think", "iw9_ThermalCam.GimbalDynamics", function()
     local speed = vehicle:GetVelocity():Length()
     local zoomMul = (FOV_BASE / math.max(cam.fov, FOV_MIN)) ^ VIB_ZOOM_POWER
     local amp = (VIB_BASE + speed * VIB_SPEED_SCALE) * zoomMul
+    -- Mute vibration until fully deployed.
+    if not IsDeployed() then amp = amp * cam.deployFrac * 0.3 end
     local t = RealTime()
     cam.shakeP = math.sin(t * 17.3) * amp * 0.55 + math.sin(t * 29.1) * amp * 0.25
     cam.shakeY = math.sin(t * 19.7) * amp * 0.45 + math.cos(t * 23.4) * amp * 0.30
     cam.shakeR = math.sin(t * 13.2) * amp * 0.20
-
-    local heatLoad = math.Clamp(#haloTargets / 6, 0, 1)
-    local smear = math.Clamp(slewMag / math.max(maxRate, 1), 0, 1) * 0.35
-    local targetBloom = math.Clamp(heatLoad * 0.75 + smear, 0, 1)
-    cam.bloom = Lerp(math.min(1, 4 * dt), cam.bloom, targetBloom)
 end)
 
 hook.Add("Think", "iw9_ThermalCam.Zoom", function()
-    if not cam.active then return end
+    if not IsSensorLive() then return end
     local ply = LocalPlayer()
     if not IsValid(ply) then return end
 
@@ -755,8 +870,13 @@ end)
 
 hook.Add("PostPostHGCalcView", "iw9_ThermalCam.CalcView", function()
     if not cam.active or not CanUseThermalCam() then return end
+    if cam.deployFrac <= 0.02 then return end
 
     local origin = GetSafeCameraOrigin(cam.vehicle)
+
+    -- During deploy the pod eases out of a raised/stowed pose.
+    local stowLift = (1 - cam.deployFrac) * 18
+    origin = origin + Vector(0, 0, stowLift)
 
     local ang = Angle(
         cam.pitch + cam.shakeP,
@@ -764,10 +884,13 @@ hook.Add("PostPostHGCalcView", "iw9_ThermalCam.CalcView", function()
         cam.roll  + cam.shakeR
     )
 
+    -- FOV slightly wider while the doors are still opening.
+    local fov = Lerp(cam.deployFrac, FOV_BASE + 20, cam.fov)
+
     return {
         origin     = origin,
         angles     = ang,
-        fov        = cam.fov,
+        fov        = fov,
         drawviewer = true,
     }
 end)
@@ -785,31 +908,13 @@ local thermalColorModify = {
 }
 
 hook.Add("RenderScreenspaceEffects", "iw9_ThermalCam.Effect", function()
-    if not cam.active then return end
-
-    local b = cam.bloom
-
-    thermalColorModify["$pp_colour_contrast"]   = Lerp(b, 1.35, 0.95)
-    thermalColorModify["$pp_colour_brightness"] = Lerp(b, 0.00, 0.08)
-    thermalColorModify["$pp_colour_addg"]       = Lerp(b, 0.05, 0.12)
-    thermalColorModify["$pp_colour_addr"]       = Lerp(b, 0.00, 0.03)
+    if not IsSensorLive() then return end
     DrawColorModify(thermalColorModify)
-
-    local darken = Lerp(b, 0.75, 0.35)
-    local mul    = Lerp(b, 1.2,  2.8)
-    local blurx  = Lerp(b, 4,    14)
-    local blury  = Lerp(b, 4,    14)
-    local passes = math.floor(Lerp(b, 1, 3) + 0.5)
-    DrawBloom(darken, mul, blurx, blury, passes, 1, 0.55, 1.0, 0.45)
-
-    if b > 0.15 then
-        DrawMotionBlur(0.08 + b * 0.12, 0.6 + b * 0.25, 0.01)
-    end
 end)
 
 hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
     table.Empty(haloTargets)
-    if not cam.active or not IsValid(cam.vehicle) then return end
+    if not IsSensorLive() or not IsValid(cam.vehicle) then return end
 
     local origin = GetSafeCameraOrigin(cam.vehicle)
     local me = LocalPlayer()
@@ -837,11 +942,9 @@ hook.Add("PreDrawHalos", "iw9_ThermalCam.DetectPeople", function()
 
     if #haloTargets > 0 then
         local pulse = 220 + math.sin(RealTime() * 15) * 35
-        local b = cam.bloom
 
-        local outer = 4 + b * 6
-        halo.Add(haloTargets, Color(200, 255, 200, (pulse * 0.35) * (0.7 + b * 0.6)), outer, outer, 1, true, false)
-        halo.Add(haloTargets, Color(230, 255, 230, 180 + b * 60), 2 + b * 2, 2 + b * 2, 2, true, false)
+        halo.Add(haloTargets, Color(200, 255, 200, pulse * 0.35), 4, 4, 1, true, false)
+        halo.Add(haloTargets, Color(230, 255, 230, 180), 2, 2, 2, true, false)
         halo.Add(haloTargets, Color(pulse, pulse, pulse, 255), 1, 1, 3, true, false)
 
         if IsValid(cam.lockTarget) then
@@ -871,6 +974,33 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     local lockCol  = Color(255, 200, 60, 240)
     local lrfCol   = Color(120, 220, 255, 240)
 
+    local sLeft   = h * 0.1
+    local sRight  = w - (h * 0.1)
+    local bHeight = h - (h * 0.1)
+
+    -- Deploy / stow progress screen
+    if cam.deployState == "deploying" or cam.deployState == "stowing" then
+        local pct = math.floor(cam.deployFrac * 100)
+        local label = cam.deployState == "deploying" and "GIMBAL DEPLOYING" or "GIMBAL STOWING"
+        local barW, barH = w * 0.28, 8
+        local bx = cx - barW / 2
+        local by = cy + h * 0.06
+
+        surface.SetDrawColor(0, 0, 0, 160)
+        surface.DrawRect(0, 0, w, h)
+
+        HDTS_Text(label, cx, cy - 20, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER, col)
+        HDTS_Text(string.format("%d%%", pct), cx, cy + 4, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER, col)
+
+        surface.SetDrawColor(40, 80, 50, 220)
+        surface.DrawOutlinedRect(bx, by, barW, barH)
+        surface.SetDrawColor(80, 255, 140, 230)
+        surface.DrawRect(bx + 1, by + 1, (barW - 2) * cam.deployFrac, barH - 2)
+        return
+    end
+
+    if not IsDeployed() then return end
+
     local veh = cam.vehicle
     local pos = IsValid(veh) and veh:GetPos() or Vector(0, 0, 0)
     local vel = IsValid(veh) and veh:GetVelocity() or Vector(0, 0, 0)
@@ -880,10 +1010,6 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     local trueAzimuth = ((-cam.yaw % 360) + 360) % 360
     local isNarrowFov = cam.fov < FOV_BASE - 5
     local isLocked = IsValid(cam.lockTarget)
-
-    local sLeft   = h * 0.1
-    local sRight  = w - (h * 0.1)
-    local bHeight = h - (h * 0.1)
 
     local fW, fH = w * 0.65, h * 0.65
     local bx, by = cx - fW / 2, cy - fH / 2
@@ -914,6 +1040,18 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     surface.DrawLine(cx, cy + gH, cx, cy + gH + lH)
     surface.DrawLine(cx - 3, cy, cx + 3, cy)
     surface.DrawLine(cx, cy - 3, cx, cy + 3)
+
+    -- Lead pip while locked (offset from center by angular lead → screen px).
+    if isLocked then
+        local pxPerDeg = (w * 0.5) / math.max(cam.fov * 0.5, 1)
+        local lx = cx + cam.leadAz * pxPerDeg
+        local ly = cy - cam.leadEl * pxPerDeg
+        surface.SetDrawColor(lockCol)
+        local s = 6
+        surface.DrawLine(lx - s, ly, lx + s, ly)
+        surface.DrawLine(lx, ly - s, lx, ly + s)
+        surface.DrawOutlinedRect(lx - 3, ly - 3, 6, 6)
+    end
 
     local tapeSpanDeg = math.Clamp(cam.fov * 1.5, 30, 90)
     local pxScaleMap  = (fW * 0.7) / tapeSpanDeg
@@ -960,14 +1098,29 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     HDTS_Text(isLocked and "WPN  : TRACK" or "WPN  : SAFE", sLeft, sLeft + 15, nil, nil, isLocked and lockCol or col)
     HDTS_Text("LSR  : " .. lrfStatus, sLeft, sLeft + 30, nil, nil, lrfStatusCol)
 
-    -- Live range under status when a hold is active
+    local yOff = 45
     if LRFHoldActive() then
         if cam.lrfValid then
-            HDTS_Text(string.format("RNG  : %05.0f M", cam.lrfMeters), sLeft, sLeft + 45, nil, nil, lrfCol)
-            HDTS_Text(string.format("     : %05.0f FT", cam.lrfFeet), sLeft, sLeft + 60, nil, nil, lrfCol)
+            HDTS_Text(string.format("RNG  : %05.0f M", cam.lrfMeters), sLeft, sLeft + yOff, nil, nil, lrfCol)
+            HDTS_Text(string.format("     : %05.0f FT", cam.lrfFeet), sLeft, sLeft + yOff + 15, nil, nil, lrfCol)
+            yOff = yOff + 30
         else
-            HDTS_Text("RNG  : ----- M", sLeft, sLeft + 45, nil, nil, alertCol)
+            HDTS_Text("RNG  : ----- M", sLeft, sLeft + yOff, nil, nil, alertCol)
+            yOff = yOff + 15
         end
+    end
+
+    -- Lead / rate block (always shows gimbal slew; target rates when locked)
+    local slewMag = math.sqrt(cam.rateYaw * cam.rateYaw + cam.ratePitch * cam.ratePitch)
+    HDTS_Text(string.format("SLEW : %05.1f °/s", slewMag), sLeft, sLeft + yOff, nil, nil, hudCol)
+    yOff = yOff + 15
+
+    if isLocked then
+        HDTS_Text(string.format("RATE : AZ %+05.1f", cam.tgtRateAz), sLeft, sLeft + yOff, nil, nil, lockCol)
+        HDTS_Text(string.format("       EL %+05.1f", cam.tgtRateEl), sLeft, sLeft + yOff + 15, nil, nil, lockCol)
+        HDTS_Text(string.format("TSPD : %04.0f KTS", cam.tgtSpeedKts), sLeft, sLeft + yOff + 30, nil, nil, lockCol)
+        HDTS_Text(string.format("LEAD : AZ %+04.1f°", cam.leadAz), sLeft, sLeft + yOff + 45, nil, nil, lockCol)
+        HDTS_Text(string.format("       EL %+04.1f°", cam.leadEl), sLeft, sLeft + yOff + 60, nil, nil, lockCol)
     end
 
     local factorZOOM = 1 + ((FOV_BASE - cam.fov) / (FOV_BASE - FOV_MIN) * 9)
@@ -983,7 +1136,6 @@ hook.Add("HUDPaint", "iw9_ThermalCam.HUD", function()
     HDTS_Text(string.format("COORDN : %06.0f", rndLat), sRight, bHeight - 30, TEXT_ALIGN_RIGHT, nil, hudCol)
     HDTS_Text(string.format("COORDE : %06.0f", rndLon), sRight, bHeight - 15, TEXT_ALIGN_RIGHT, nil, hudCol)
 
-    -- Large center range callout after a successful pulse
     if LRFHoldActive() and cam.lrfValid then
         local age = CurTime() - cam.lrfTime
         local alpha = age < 1 and 255 or math.Clamp(255 * (1 - (age - 1) / (LRF_HOLD_TIME - 1)), 80, 255)
