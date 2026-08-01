@@ -1,4 +1,3 @@
-
 if not SERVER then return end
 
 util.AddNetworkString("zb_poses_set")
@@ -171,7 +170,16 @@ function zb.poses.Apply(ply, id)
 			ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 		end
 	else
-		ply.zb_pose_next = nil
+		-- Phase 0 = one-shot, non-looping pose. The Think loop never touches
+		-- this again, but CalcMainActivity still needs to know when the
+		-- clip finishes so an override_weapon pose doesn't get stuck
+		-- overriding the main sequence forever.
+		local dur = 2
+		if s then
+			local d = ply:SequenceDuration(s)
+			if d and d > 0.1 then dur = d end
+		end
+		ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 	end
 
 	net.Start("zb_poses_set")
@@ -261,7 +269,12 @@ hook.Add("Think", "zb_poses_hold_loop", function()
 				ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 			else
 				ply.zb_pose_phase = 0
-				ply.zb_pose_next = nil
+				local dur = 2
+				if s then
+					local d = ply:SequenceDuration(s)
+					if d and d > 0.1 then dur = d end
+				end
+				ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 			end
 			
 		elseif ply.zb_pose_phase == 2 then
