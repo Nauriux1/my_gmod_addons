@@ -1,5 +1,3 @@
-
-
 zb = zb or {}
 zb.poses = zb.poses or {}
 
@@ -51,7 +49,7 @@ zb.poses.List = {
         seq = "g_clap", 
         seq2 = { "g_claplooparms" }, 
         switch_delay = 1.5,
-        hold = true, stop_on_move = false, auto_holster = true 
+        hold = true, stop_on_move = false, auto_holster = true, override_weapon = true
     },
     { 
         id = "plead", name = "Plead", 
@@ -97,3 +95,39 @@ hook.Add("SetupMove", "zb_poses_slowdown", function(ply, mv, cmd)
         end
     end
 end)
+
+-- override_weapon poses need to beat the arm/hand IK that two-handed weapon
+-- holdtypes drive - a gesture slot alone can't do that, it only layers on
+-- top of whatever the main sequence already is.
+--
+-- We do NOT touch CalcMainActivity. That hook is what picks the correct
+-- movement-based base activity (idle/walk/run) every frame - forcing it to
+-- a fixed activity froze the legs regardless of actual movement, and could
+-- even resolve to an invalid/mismatched activity on a non-stock playermodel.
+--
+-- Instead we only intercept TranslateActivity - the step that takes the
+-- generic base activity CalcMainActivity picked (e.g. ACT_HL2MP_IDLE) and
+-- maps it into the weapon-specific two-handed variant (e.g.
+-- ACT_HL2MP_IDLE_AR2), which is what locks the arms into the gun grip.
+-- Returning the incoming activity unchanged skips that weapon-specific
+-- remap entirely, so legs keep playing whatever correct idle/walk/run
+-- activity CalcMainActivity already chose, while the arms are freed up for
+-- the gesture-slot layer (bone-masked to arms/upper body only, set up in
+-- sv_poses.lua/cl_poses.lua) to actually show through.
+--
+-- NOTE: must return identically on client AND server (server needs it for
+-- hit detection), which is why this lives in the shared file.
+local function poseOverrideActive(ply)
+    if not IsValid(ply) or not ply.zb_pose_id then return false end
+    local pose = zb.poses.Get(ply.zb_pose_id)
+    if not pose or not pose.override_weapon then return false end
+    -- zb_pose_next doubles as "when does the current clip end" for every
+    -- phase (including one-shots, see sv_poses.lua / cl_poses.lua)
+    if not ply.zb_pose_next or CurTime() >= ply.zb_pose_next then return false end
+    return true
+end
+
+-- Public: other files (e.g. weapons/homigrad_base/sh_worldmodel.lua's TPIK
+-- code) can check this to know whether they should treat the player as
+-- "posed" and back off their own animation/rotation overrides.
+zb.poses.IsOverrideActive = poseOverrideActive
