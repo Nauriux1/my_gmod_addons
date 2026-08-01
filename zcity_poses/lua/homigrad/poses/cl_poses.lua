@@ -46,7 +46,14 @@ net.Receive("zb_poses_set", function()
 			ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 		end
 	else
-		ply.zb_pose_next = nil
+		-- Phase 0 = one-shot pose. Keep an expiry so CalcMainActivity (in
+		-- sh_poses.lua) knows when to stop overriding the main sequence.
+		local dur = 2
+		if s then
+			local d = ply:SequenceDuration(s)
+			if d and d > 0.1 then dur = d end
+		end
+		ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 	end
 end)
 
@@ -99,7 +106,12 @@ hook.Add("Think", "zb_poses_hold_loop_cl", function()
 				ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 			else
 				ply.zb_pose_phase = 0
-				ply.zb_pose_next = nil
+				local dur = 2
+				if s then
+					local d = ply:SequenceDuration(s)
+					if d and d > 0.1 then dur = d end
+				end
+				ply.zb_pose_next = CurTime() + math.max(0.4, dur * 0.95)
 			end
 			
 		elseif ply.zb_pose_phase == 2 then
