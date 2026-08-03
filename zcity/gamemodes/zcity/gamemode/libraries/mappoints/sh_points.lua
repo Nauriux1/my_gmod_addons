@@ -13,6 +13,23 @@ zb.Points.RandomSpawns = zb.Points.RandomSpawns or {}
 zb.Points.RandomSpawns.Color = Color(122,122,0)
 zb.Points.RandomSpawns.Name = "RandomSpawns"
 
+-- Tubbycity / Slendytubbies 3 points (use Point Editor tool in-game)
+zb.Points.Tubby_Custard = zb.Points.Tubby_Custard or {}
+zb.Points.Tubby_Custard.Color = Color(255, 200, 50)
+zb.Points.Tubby_Custard.Name = "Tubby_Custard"
+
+zb.Points.Tubby_SurvivorSpawn = zb.Points.Tubby_SurvivorSpawn or {}
+zb.Points.Tubby_SurvivorSpawn.Color = Color(100, 200, 255)
+zb.Points.Tubby_SurvivorSpawn.Name = "Tubby_SurvivorSpawn"
+
+zb.Points.Tubby_EnemySpawn = zb.Points.Tubby_EnemySpawn or {}
+zb.Points.Tubby_EnemySpawn.Color = Color(200, 40, 40)
+zb.Points.Tubby_EnemySpawn.Name = "Tubby_EnemySpawn"
+
+zb.Points.Tubby_WaveSpawn = zb.Points.Tubby_WaveSpawn or {}
+zb.Points.Tubby_WaveSpawn.Color = Color(180, 80, 255)
+zb.Points.Tubby_WaveSpawn.Name = "Tubby_WaveSpawn"
+
 if SERVER then
     util.AddNetworkString("zb_getallpoints")
     util.AddNetworkString("zb_getspecificpoints")
