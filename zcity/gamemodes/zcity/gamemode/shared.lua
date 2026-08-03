@@ -1,11 +1,11 @@
-GM.Name = "ZCity"
-GM.Author = "uzelezz, sadsalat, Mr. Point, Zac90, Deka, Mannytko"
+GM.Name = "Tubbycity"
+GM.Author = "uzelezz, sadsalat, Mr. Point, Zac90, Deka, Mannytko (ST3 parody rework)"
 GM.Email = "N/A"
 GM.Website = "N/A"
 
-team.SetUp(0, "Players", Color(255, 0, 0))
-team.SetUp(1, "Players2", Color(0, 0, 255))
-team.SetUp(2, "Players3", Color(0, 255, 0))
+team.SetUp(0, "Survivors", Color(100, 200, 255))
+team.SetUp(1, "Enemy", Color(200, 50, 50))
+team.SetUp(2, "Infected", Color(80, 200, 80))
 
 DeriveGamemode("sandbox")
 
