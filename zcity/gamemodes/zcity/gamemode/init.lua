@@ -37,19 +37,45 @@ local spawners = {}
 local function getRandSpawn()
 	spawners = {}
 
-	if zb.GetMapPoints and #zb.GetMapPoints( "Spawnpoint" ) > 0 then
-		for k, v in RandomPairs(zb.GetMapPoints( "Spawnpoint" )) do
-			spawners[#spawners + 1] = v.pos
-		end
-	else
-		for i, ent in RandomPairs(ents.FindByClass("info_player_start")) do
-			spawners[#spawners + 1] = ent:GetPos()
-		end
-
-		for i, str in ipairs(default_spawns) do
-			for k, v in RandomPairs(ents.FindByClass(str)) do
-				spawners[#spawners + 1] = v:GetPos()
+	local pts = zb.GetMapPoints and zb.GetMapPoints("Spawnpoint")
+	if istable(pts) and #pts > 0 then
+		for k, v in RandomPairs(pts) do
+			if istable(v) and v.pos then
+				spawners[#spawners + 1] = v.pos
+			elseif isvector(v) then
+				spawners[#spawners + 1] = v
 			end
+		end
+	end
+
+	-- Always collect map entity spawns as backup / primary
+	for i, ent in RandomPairs(ents.FindByClass("info_player_start")) do
+		spawners[#spawners + 1] = ent:GetPos()
+	end
+
+	for i, str in ipairs(default_spawns) do
+		for k, v in RandomPairs(ents.FindByClass(str)) do
+			spawners[#spawners + 1] = v:GetPos()
+		end
+	end
+
+	-- Navmesh random points so empty maps still work
+	if #spawners == 0 and navmesh and navmesh.GetAllNavAreas then
+		local areas = navmesh.GetAllNavAreas() or {}
+		for k, area in RandomPairs(areas) do
+			if #spawners > 32 then break end
+			if area and area.GetCenter then
+				local c = area:GetCenter()
+				if c then spawners[#spawners + 1] = c + vecup end
+			end
+		end
+	end
+
+	-- Absolute last resort: world origin / player positions
+	if #spawners == 0 then
+		spawners[1] = Vector(0, 0, 64)
+		for _, ply in player.Iterator() do
+			if IsValid(ply) then spawners[#spawners + 1] = ply:GetPos() end
 		end
 	end
 end
@@ -67,8 +93,12 @@ end)
 
 function zb:GetTeamSpawn(ply)
 	local team_ = ply:Team()
+	local mode = CurrentRound and CurrentRound()
 
-	local team0spawns, team1spawns = CurrentRound():GetTeamSpawn()
+	local team0spawns, team1spawns
+	if mode and mode.GetTeamSpawn then
+		team0spawns, team1spawns = mode:GetTeamSpawn()
+	end
 
 	if !team0spawns or !next(team0spawns) then
 		team0spawns = {zb:GetRandomSpawn()}
@@ -100,8 +130,6 @@ function zb:GetTeamSpawn(ply)
 		return pos
 	end
 
-	ErrorNoHalt("TEAM SPAWN COULDN'T BE FOUND. INVALID TEAM")
-
 	return team0spawns[1]
 end
 
@@ -120,6 +148,7 @@ end
 
 function zb:GetRandomSpawn(target, spawns)
 	if !spawns or table.IsEmpty(spawns) then
+		if #spawners == 0 then getRandSpawn() end
 		spawns = spawners
 	end
 
@@ -128,12 +157,12 @@ end
 
 function zb:FurthestFromEveryone(chooseTbl, restrictTbl, func, iStart, iEnd)
 	if not chooseTbl or table.IsEmpty(chooseTbl) then
+		if #spawners == 0 then getRandSpawn() end
 		chooseTbl = spawners
 	end
 
 	if not restrictTbl then
 		restrictTbl = player.GetAll()
-
 		func = check_playerspawns
 	end
 
@@ -171,10 +200,12 @@ function GM:PlayerSelectSpawn(ply, transition)
 end
 
 local function PlayerSelectSpawn(ply, transition)
-	if CurrentRound() and CurrentRound().randomSpawns then
-		local randSpawn = zb:GetRandomSpawn()
-		ply:SetPos(randSpawn)
+	local mode = CurrentRound and CurrentRound()
 
+	-- Tubbycity: randomize when mode asks for it, or no custom points yet
+	if mode and mode.randomSpawns then
+		local randSpawn = zb:GetRandomSpawn()
+		if randSpawn then ply:SetPos(randSpawn) end
 		return
 	end
 
@@ -182,7 +213,7 @@ local function PlayerSelectSpawn(ply, transition)
 
 	if not spawnPos then
 		local randSpawn = zb:GetRandomSpawn()
-		ply:SetPos(randSpawn)
+		if randSpawn then ply:SetPos(randSpawn) end
 	else
 		ply:SetPos(spawnPos)
 	end
