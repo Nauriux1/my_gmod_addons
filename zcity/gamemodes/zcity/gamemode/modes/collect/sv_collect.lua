@@ -59,7 +59,6 @@ function MODE:GetTeamSpawn()
 		survivors = PointsToPositions("Spawnpoint")
 	end
 	if not survivors or not next(survivors) then
-		-- random map spawns so players can join before placing points
 		local pos = zb.GetRandomSpawn and zb:GetRandomSpawn() or nil
 		survivors = pos and { pos } or {}
 	end
@@ -75,9 +74,12 @@ function MODE:GiveEquipment()
 			ply:SetSuppressPickupNotices(true)
 			ply.noSound = true
 
-			pcall(function()
-				ply:SetModel(MODE.SurvivorModel or "models/player/group01/male_02.mdl")
-			end)
+			-- Teletubby model + bodygroups from appearance menu
+			if zb.Tubby and zb.Tubby.Apply then
+				zb.Tubby.Apply(ply)
+			elseif ApplyAppearance then
+				ApplyAppearance(ply)
+			end
 
 			ply:Give("weapon_hands_sh")
 			ply:SelectWeapon("weapon_hands_sh")
