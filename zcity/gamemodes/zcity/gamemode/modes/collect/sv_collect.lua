@@ -1,13 +1,36 @@
 local MODE = MODE
 
 MODE.name = "collect"
+MODE.PrintName = "Collect"
 MODE.Chance = 0.35
 MODE.ROUND_TIME = 600
 MODE.start_time = 5
 MODE.CustardCount = 10
+MODE.randomSpawns = true -- spawn anywhere until Tubby_SurvivorSpawn points exist
 
 function MODE:CanLaunch()
 	return true
+end
+
+local function SafePoints(group)
+	if not zb.GetMapPoints then return {} end
+	local pts = zb.GetMapPoints(group)
+	if not pts or pts == false then return {} end
+	return pts
+end
+
+local function PointsToPositions(group)
+	local pts = SafePoints(group)
+	if #pts == 0 then return {} end
+	if zb.TranslatePointsToVectors then
+		return zb.TranslatePointsToVectors(pts) or {}
+	end
+	local out = {}
+	for _, p in ipairs(pts) do
+		if isvector(p) then out[#out + 1] = p
+		elseif istable(p) and p.pos then out[#out + 1] = p.pos end
+	end
+	return out
 end
 
 function MODE:Intermission()
@@ -15,7 +38,7 @@ function MODE:Intermission()
 
 	for _, ply in player.Iterator() do
 		if ply:Team() == TEAM_SPECTATOR then continue end
-		ply:SetupTeam(0) -- all survivors
+		ply:SetupTeam(0)
 	end
 end
 
@@ -27,12 +50,18 @@ function MODE:RoundStart()
 
 	self:SpawnCustards()
 	self:SpawnEnemyNPC()
+	PrintMessage(HUD_PRINTTALK, "Collect mode: Find all Tubby Custards. Avoid the enemy.")
 end
 
 function MODE:GetTeamSpawn()
-	local survivors = zb.TranslatePointsToVectors(zb.GetMapPoints("Tubby_SurvivorSpawn"))
+	local survivors = PointsToPositions("Tubby_SurvivorSpawn")
 	if not survivors or not next(survivors) then
-		survivors = zb.TranslatePointsToVectors(zb.GetMapPoints("Spawnpoint"))
+		survivors = PointsToPositions("Spawnpoint")
+	end
+	if not survivors or not next(survivors) then
+		-- random map spawns so players can join before placing points
+		local pos = zb.GetRandomSpawn and zb:GetRandomSpawn() or nil
+		survivors = pos and { pos } or {}
 	end
 	return survivors, survivors
 end
@@ -46,17 +75,15 @@ function MODE:GiveEquipment()
 			ply:SetSuppressPickupNotices(true)
 			ply.noSound = true
 
-			-- Placeholder model until Slendytubbies player models are added
 			pcall(function()
 				ply:SetModel(MODE.SurvivorModel or "models/player/group01/male_02.mdl")
 			end)
 
 			ply:Give("weapon_hands_sh")
 			ply:SelectWeapon("weapon_hands_sh")
-			-- Flashlight-style light source feel (use default flashlight)
 			pcall(function() ply:AllowFlashlight(true) end)
 
-			zb.GiveRole(ply, "Survivor", Color(100, 200, 255))
+			if zb.GiveRole then zb.GiveRole(ply, "Survivor", Color(100, 200, 255)) end
 
 			timer.Simple(0.1, function()
 				if IsValid(ply) then ply.noSound = false end
@@ -67,16 +94,15 @@ function MODE:GiveEquipment()
 end
 
 function MODE:SpawnCustards()
-	local points = zb.GetMapPoints("Tubby_Custard") or {}
-	local count = math.min(self.CustardCount or 10, math.max(#points, 1))
+	local points = SafePoints("Tubby_Custard")
+	local count = self.CustardCount or 10
 
 	self.CustardsLeft = 0
 	self.ActiveCustards = {}
 
 	if #points == 0 then
-		-- Fallback: random nav / spawn positions
 		for i = 1, count do
-			local pos = zb:GetRandomSpawn()
+			local pos = zb.GetRandomSpawn and zb:GetRandomSpawn()
 			if pos then
 				local ent = ents.Create("ent_tubby_custard")
 				if IsValid(ent) then
@@ -97,8 +123,8 @@ function MODE:SpawnCustards()
 		local p = shuffled[i]
 		local ent = ents.Create("ent_tubby_custard")
 		if IsValid(ent) then
-			ent:SetPos(p.pos + Vector(0, 0, 8))
-			ent:SetAngles(p.ang or Angle(0, 0, 0))
+			ent:SetPos((p.pos or p) + Vector(0, 0, 8))
+			if p.ang then ent:SetAngles(p.ang) end
 			ent:Spawn()
 			self.CustardsLeft = self.CustardsLeft + 1
 			table.insert(self.ActiveCustards, ent)
@@ -107,89 +133,50 @@ function MODE:SpawnCustards()
 end
 
 function MODE:SpawnEnemyNPC()
-	local points = zb.GetMapPoints("Tubby_EnemySpawn") or {}
+	local points = SafePoints("Tubby_EnemySpawn")
 	local pos
 
 	if #points > 0 then
-		pos = table.Random(points).pos
+		local p = points[math.random(#points)]
+		pos = p.pos or p
 	else
-		pos = zb:GetRandomSpawn()
+		pos = zb.GetRandomSpawn and zb:GetRandomSpawn()
 	end
 
 	if not pos then return end
 
-	local npc = ents.Create(self.EnemyNPCClass or "npc_fastzombie")
+	local npc = ents.Create("npc_zombie")
 	if not IsValid(npc) then return end
-
-	npc:SetPos(pos + Vector(0, 0, 10))
+	npc:SetPos(pos + Vector(0, 0, 8))
 	npc:Spawn()
 	npc:Activate()
 	npc:SetHealth(500)
 	npc:SetMaxHealth(500)
-
-	-- Prefer hunting players
-	for _, ply in player.Iterator() do
-		if ply:Alive() and ply:Team() ~= TEAM_SPECTATOR then
-			npc:AddEntityRelationship(ply, D_HT, 99)
-		end
-	end
-
 	self.EnemyNPC = npc
 end
 
-function MODE:OnCustardCollected(ply, ent)
-	if not self.CustardsLeft then return end
-	self.CustardsLeft = math.max(0, self.CustardsLeft - 1)
-
-	PrintMessage(HUD_PRINTTALK, string.format("%s collected a Tubby Custard! (%d left)", ply:Nick(), self.CustardsLeft))
-
-	if self.CustardsLeft <= 0 then
-		-- Survivors win
-		zb.ROUND_STATE = 2
-		PrintMessage(HUD_PRINTTALK, "All custards collected! Survivors win!")
+function MODE:ShouldRoundEnd()
+	if (self.CustardsLeft or 0) <= 0 and self.ActiveCustards then
+		return true
 	end
+	local alive = zb.CheckAlive and zb:CheckAlive(true) or {}
+	return #alive == 0
 end
 
 function MODE:CheckAlivePlayers()
-	return zb:CheckAliveTeams(true)
-end
-
-function MODE:ShouldRoundEnd()
-	if (self.CustardsLeft or 1) <= 0 then
-		return true, 0 -- survivors win
-	end
-
-	local alive = zb:CheckAlive(true)
-	if #alive == 0 then
-		return true, 1 -- enemy / wipe
-	end
-
-	return false
+	return zb.CheckAliveTeams and zb:CheckAliveTeams(true) or {}
 end
 
 function MODE:RoundThink()
-	-- Keep NPC hostile if it exists
-	if IsValid(self.EnemyNPC) then
-		for _, ply in player.Iterator() do
-			if ply:Alive() and ply:Team() ~= TEAM_SPECTATOR then
-				self.EnemyNPC:AddEntityRelationship(ply, D_HT, 99)
-			end
-		end
-	end
 end
 
 function MODE:EndRound()
-	local endround, winner = self:ShouldRoundEnd()
-	for _, ply in player.Iterator() do
-		if ply:Team() == 0 and (self.CustardsLeft or 1) <= 0 then
-			pcall(function() ply:GiveExp(math.random(20, 40)) end)
-		end
-	end
-end
-
-function MODE:PlayerDeath(ply)
-	-- Collect is fail-on-death style for the group if all die
+	if IsValid(self.EnemyNPC) then self.EnemyNPC:Remove() end
 end
 
 function MODE:CanSpawn()
+	return zb.ROUND_STATE == 0
+end
+
+function MODE:PlayerDeath(ply)
 end
