@@ -251,47 +251,16 @@ end
 
 ZBATTLE_BIGMAP = 5700
 
-hook.Add("InitPostEntity", "loadbigmap", function()
-	local filik = file.Read("zbattle/mapsizes.json", "DATA")
-	if filik then
-		local tbl = util.JSONToTable(filik)
-		if tbl and tbl[game.GetMap()] then
-			ZBATTLE_BIGMAP = tbl[game.GetMap()]
-		end
-	end
-end)
-
 COMMANDS = COMMANDS or {}
-COMMANDS.bigmap = {
-	function(ply, args)
-		if not ply:IsAdmin() then ply:ChatPrint("You don't have access") return end
-		ZBATTLE_BIGMAP = tonumber(args[1])
-		ply:ChatPrint("Distance for big map: " .. ZBATTLE_BIGMAP)
-		if zb.RerollChances then zb.RerollChances() end
-		file.CreateDir("zbattle")
-		local tbl = util.JSONToTable(file.Read("zbattle/mapsizes.json", "DATA") or util.TableToJSON({[game.GetMap()] = ZBATTLE_BIGMAP})) or {}
-		tbl[game.GetMap()] = ZBATTLE_BIGMAP
-		file.Write("zbattle/mapsizes.json", util.TableToJSON(tbl))
-		ply:ChatPrint("Saved into a file")
-	end,
-	0
-}
 
 function zb.GetAvailableModes()
-	if zb.tdm_checkpoints then zb.tdm_checkpoints() end
-
+	-- Tubbycity: do not run legacy TDM checkpoint conversion
 	local newtbl = {}
 	for i, name in pairs(zb.GetModes()) do
 		local tbl = zb.modes[name]
 		if not tbl then continue end
 		if (not tbl.CanLaunch or tbl:CanLaunch()) then
-			if tbl.SubModes then
-				for i, name2 in pairs(tbl:SubModes()) do
-					table.insert(newtbl, name2)
-				end
-			else
-				table.insert(newtbl, name)
-			end
+			table.insert(newtbl, name)
 		end
 	end
 	return newtbl
@@ -337,16 +306,7 @@ function zb.WeightedChanceMode(modes_chances)
 end
 
 function zb.GetWorldSize()
-	local dist = 0
-	local pts = zb.GetMapPoints and zb.GetMapPoints("RandomSpawns") or {}
-	for _, pnt in pairs(pts) do
-		for _, pnt2 in pairs(pts) do
-			if pnt.pos and pnt2.pos then
-				dist = math.max(dist, pnt.pos:DistToSqr(pnt2.pos))
-			end
-		end
-	end
-	return math.sqrt(dist)
+	return 0
 end
 
 function zb.GetRoundName(name)
