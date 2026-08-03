@@ -1,3 +1,6 @@
+zb = zb or {}
+hg = hg or {}
+
 GM.Name = "Tubbycity"
 GM.Author = "uzelezz, sadsalat, Mr. Point, Zac90, Deka, Mannytko (ST3 parody rework)"
 GM.Email = "N/A"
@@ -10,13 +13,13 @@ team.SetUp(2, "Infected", Color(80, 200, 80))
 DeriveGamemode("sandbox")
 
 local blur = Material("pp/blurscreen")
-local hg_potatopc -- НАДО ЭТО ГОВНО ПЕРЕПИСАТЬ НОРМАЛЬНО, И ВСЕ МЕНЮШКИ ОДИНАКОВЫЕ ТОЖЕ!!!
+local hg_potatopc
 function hg.DrawBlur(panel, amount, passes, alpha)
 	if is3d2d then return end
 	amount = amount or 5
-	hg_potatopc = hg_potatopc or hg.ConVars.potatopc
+	hg_potatopc = hg_potatopc or (hg.ConVars and hg.ConVars.potatopc)
 
-	if(hg_potatopc:GetBool())then
+	if hg_potatopc and hg_potatopc.GetBool and hg_potatopc:GetBool() then
 		surface.SetDrawColor(0, 0, 0, alpha or (amount * 20))
 		surface.DrawRect(0, 0, panel:GetWide(), panel:GetTall())
 	else
@@ -29,7 +32,7 @@ function hg.DrawBlur(panel, amount, passes, alpha)
 		for i = -(passes or 0.2), 1, 0.2 do
 			blur:SetFloat("$blur", i * amount)
 			blur:Recompute()
-			
+
 			render.UpdateScreenEffectTexture()
 			surface.DrawTexturedRect(x * -1, y * -1, ScrW(), ScrH())
 		end
@@ -38,7 +41,6 @@ end
 
 local function BlockSpawn(ply, ent)
 	if game.SinglePlayer() or ply:IsAdmin() then return true end
-
 	return false
 end
 
@@ -48,29 +50,28 @@ for _, v in ipairs(spawn) do
 	hook.Add(v, "BlockSpawn", BlockSpawn)
 end
 
-hook.Add( "PlayerNoClip", "FeelFreeToTurnItOff", function( ply, desiredState )
-	if ( desiredState == false ) then -- the player wants to turn noclip off
-		return true -- always allow
-	elseif ( ply:IsAdmin() ) then
-		return true -- allow administrators to enter noclip
+hook.Add("PlayerNoClip", "FeelFreeToTurnItOff", function(ply, desiredState)
+	if desiredState == false then
+		return true
+	elseif ply:IsAdmin() then
+		return true
 	end
-
 	return false
-end )
+end)
 
 if CLIENT then
-	hook.Add( "PlayerBindPress", "PlayerBindPressExample", function( ply, bind, pressed )
-		if ( string.find( bind, "+menu" ) ) then
+	hook.Add("PlayerBindPress", "PlayerBindPressExample", function(ply, bind, pressed)
+		if string.find(bind, "+menu") then
 			--return true
 		end
-	end )
+	end)
 
-	hook.Add( "SpawnMenuOpen", "SpawnMenuWhitelist", function()
+	hook.Add("SpawnMenuOpen", "SpawnMenuWhitelist", function()
 		local ply = LocalPlayer()
 		if ply:IsSuperAdmin() then return end
 		if ply:IsAdmin() then return end
 		return false
-	end )
+	end)
 end
 
 local team_GetAllTeams = team.GetAllTeams
@@ -121,12 +122,13 @@ function zb:CheckPlaying()
 	for _, ply in player.Iterator() do
 		if ply:Team() == TEAM_SPECTATOR then continue end
 		if not ply:Alive() then continue end
-		
 		tbl[#tbl + 1] = ply
 	end
 	return tbl
 end
 
 function GM:GrabEarAnimation(ply)
-	hg.earanim(ply)
+	if hg and hg.earanim then
+		hg.earanim(ply)
+	end
 end
