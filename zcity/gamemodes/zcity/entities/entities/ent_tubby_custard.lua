@@ -8,8 +8,7 @@ ENT.Spawnable = false
 ENT.AdminOnly = true
 ENT.Category = "Tubbycity"
 
--- Placeholder model — replace with real custard model later
-ENT.Model = "models/props_junk/garbage_takeoutcarton001a.mdl"
+ENT.Model = "models/custard/custard.mdl"
 
 function ENT:Initialize()
 	if SERVER then
@@ -24,8 +23,6 @@ function ENT:Initialize()
 		if IsValid(phys) then
 			phys:EnableMotion(false)
 		end
-
-		self:SetColor(Color(255, 220, 80))
 	end
 end
 
@@ -35,7 +32,7 @@ function ENT:Use(activator, caller)
 	if not activator:Alive() then return end
 	if activator:Team() == TEAM_SPECTATOR then return end
 
-	-- Only survivors collect
+	-- Only survivors collect (not enemy/infected teams)
 	if activator:Team() == 1 or activator:Team() == 2 then return end
 
 	local mode = zb.modes and zb.modes[zb.CROUND or ""]
@@ -51,7 +48,6 @@ if CLIENT then
 	function ENT:Draw()
 		self:DrawModel()
 
-		-- Soft glow so it's readable as a collectible
 		local dlight = DynamicLight(self:EntIndex())
 		if dlight then
 			dlight.pos = self:GetPos() + Vector(0, 0, 8)
