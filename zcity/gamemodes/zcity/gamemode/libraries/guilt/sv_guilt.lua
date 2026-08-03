@@ -15,6 +15,16 @@ local function HasMySQL()
 	return mysql ~= nil
 end
 
+local function SafeSetNetVar(ply, key, val)
+	if not IsValid(ply) then return end
+	if ply.SetNetVar then
+		ply:SetNetVar(key, val)
+	else
+		-- Homigrad netvars not loaded yet; use NW fallback
+		ply:SetNWFloat(key, isnumber(val) and val or 0)
+	end
+end
+
 hook.Add("DatabaseConnected", "GuiltCreateData", function()
 	if not HasMySQL() then return end
 	local query
@@ -36,7 +46,7 @@ hook.Add( "PlayerInitialSpawn","ZB_GuiltSQL", function( ply )
 	if not HasMySQL() then
 		zb.GuiltSQL.PlayerInstances[steamID64] = zb.GuiltSQL.PlayerInstances[steamID64] or { value = 100 }
 		ply.Karma = ply:guilt_GetValue()
-		ply:SetNetVar("Karma", ply.Karma)
+		SafeSetNetVar(ply, "Karma", ply.Karma)
 		return
 	end
 
@@ -54,16 +64,17 @@ hook.Add( "PlayerInitialSpawn","ZB_GuiltSQL", function( ply )
                 zb.GuiltSQL.PlayerInstances[steamID64].value = tonumber(result[1].value)
 
                 ply.Karma = ply:guilt_GetValue()
-                ply:SetNetVar("Karma", ply.Karma)
+                SafeSetNetVar(ply, "Karma", ply.Karma)
 
                 if zb.GuiltSQL.PlayerInstances[steamID64].value < 0 then
                     ply:guilt_SetValue( 10 )
                     local karma = ply.Karma
 
                     ply.Karma = 10
-                    ply:SetNetVar("Karma", ply.Karma)
+                    SafeSetNetVar(ply, "Karma", ply.Karma)
 
                     timer.Simple(0, function()
+                        if not IsValid(ply) then return end
                         ply:Ban(5, false)
                         ply:Kick("Your karma is too low: " .. math.Round( karma, 0 ) .. ". Try again in 5 minutes." )
                     end)
@@ -79,7 +90,7 @@ hook.Add( "PlayerInitialSpawn","ZB_GuiltSQL", function( ply )
 				zb.GuiltSQL.PlayerInstances[steamID64].value = 100
 
                 ply.Karma = ply:guilt_GetValue()
-                ply:SetNetVar("Karma",ply.Karma)
+                SafeSetNetVar(ply, "Karma", ply.Karma)
 			end
 		end)
 	query:Execute()
@@ -220,7 +231,7 @@ hook.Add("HomigradDamage", "GuiltReg", function(ply, dmgInfo, hitgroup, ent, har
         PrintMessage(HUD_PRINTTALK, "Player "..Attacker:Name().." has been banned for 30 minutes for RDMing in a team based gamemode.")
     end
 
-    Attacker:SetNetVar("Karma", Attacker.Karma)
+    SafeSetNetVar(Attacker, "Karma", Attacker.Karma)
 
     zb.GuiltTable[Attacker][Victim] = math.Clamp((zb.GuiltTable[Attacker][Victim] or 0) + guiltadd, 0, 200)
 
@@ -240,8 +251,6 @@ hook.Add("HomigradDamage", "GuiltReg", function(ply, dmgInfo, hitgroup, ent, har
 
 			if ULib then
 				ULib.addBan( steamID, 60, "Kicked and banned for having too low karma.", name, "System" )
-			else
-				-- player may already be invalid
 			end
 
             PrintMessage(HUD_PRINTTALK, "Player "..name.." has been banned for "..time.." minutes for having too low karma.")
@@ -262,7 +271,7 @@ hook.Add("Player Spawn","SlowlyRestoreKarma",function(ply)
 
     ply.lastwarning = nil
     ply.Karma = ply.Karma or 100
-    ply:SetNetVar("Karma",ply.Karma)
+    SafeSetNetVar(ply, "Karma", ply.Karma)
     ply.Guilt = 0
 end)
 
@@ -271,7 +280,7 @@ hook.Add("Player Think", "karmagain", function(ply)
     ply.KarmaGainThink = CurTime() + 120
 
     ply.Karma = math.Clamp((ply.Karma or 100) + (ply.Karma > 100 and 0.1 or (ply.KarmaGain or 0.75)), 0, zb.MaxKarma or 100)
-    ply:SetNetVar("Karma", ply.Karma)
+    SafeSetNetVar(ply, "Karma", ply.Karma)
 end)
 
 hook.Add("ZB_EndRound","savevalues",function()
@@ -326,7 +335,7 @@ net.Receive("forgive_player", function(len, ply)
     if not harm then return end
 
     ent.Karma = math.Clamp((ent.Karma or 100) + harm, 0, zb.MaxKarma or 100)
-    ent:SetNetVar("Karma",ent.Karma)
+    SafeSetNetVar(ent, "Karma", ent.Karma)
 
     zb.HarmDone[ply] = zb.HarmDone[ply] or {}
     zb.HarmDone[ply][ent] = 0
